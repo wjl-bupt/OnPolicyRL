@@ -1,0 +1,54 @@
+# PPO hyperparameters. One section per environment family -- edit the section you use.
+#
+#   oprl train ppo --config mujoco --env HalfCheetah-v5
+#   oprl train ppo --config mujoco --lr 1e-4        # the CLI overrides any single key
+#
+# Surrogate variants need no config file; switch them on the command line:
+#   --surrogate dpo
+# For the full list of hyperparameters: oprl train ppo --help
+#
+# Keys not listed here keep the code defaults (PPOConfig in oprl/algos/ppo.py).
+# The `note` key is prose and never becomes a hyperparameter.
+
+default:            # --config default, or simply omit --config
+  note: the code defaults; equivalent to passing no --config
+
+classic:            # CartPole / Acrobot / LunarLander ...
+  note: measured -- CartPole-v1, 100k steps, seed=1, return ~200 (random ~20)
+  total_steps: 100000
+  num_epochs: 4
+  ent_coef: 0.01    # a little entropy helps exploration with discrete actions
+
+mujoco:             # HalfCheetah-v5 / Ant-v5 / Walker2d-v5 ...
+  note: ported from CleanRL ppo_continuous_action.py; NOT reproduced here yet
+  num_envs: 1
+  rollout_len: 2048
+  num_minibatches: 32
+  norm_obs: true    # without these two, MuJoCo barely learns
+  norm_reward: true
+
+atari:              # ALE/Pong-v5 ... (image obs automatically select the CNN encoder)
+  note: ported from CleanRL ppo_atari.py; NOT reproduced here yet
+  total_steps: 10000000
+  num_epochs: 4
+  lr: 2.5e-4
+  clip_coef: 0.1
+  ent_coef: 0.01
+
+minatar:            # MinAtar/Breakout-v1 ... (10x10 simplified Atari, used in CI)
+  note: NOT reproduced yet; requires uv sync --extra minatar
+  num_envs: 16
+  num_epochs: 4
+  lr: 2.5e-4
+  clip_coef: 0.1
+  ent_coef: 0.01
+
+a2c:                # A2C is not a separate algorithm, just a PPO configuration
+  note: unverified. Single epoch, single minibatch, no clipping, lambda=1
+  num_epochs: 1
+  num_minibatches: 1
+  clip_coef: 1.0e9  # YAML has no inf literal; this effectively disables clipping
+  gae_lambda: 1.0
+  clip_vloss: false
+  lr: 7.0e-4
+  ent_coef: 0.01

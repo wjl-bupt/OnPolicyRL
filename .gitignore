@@ -1,0 +1,23 @@
+# Experiment output -- reproduced by re-running, never committed.
+runs/
+wandb/
+outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environments (platform-specific; uv.lock is what makes installs reproducible)
+.venv/
+venv/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store

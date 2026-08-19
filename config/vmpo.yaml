@@ -1,0 +1,25 @@
+# V-MPO hyperparameters (ICLR 2020). Usage matches ppo.yaml:
+#
+#   oprl train vmpo --config classic
+#
+# The fundamental difference from PPO: no ratio, no clipping.
+#   E-step  keep the top_k_frac samples by advantage, weight them by exp(A/eta)
+#   M-step  pull the parametric policy toward that distribution inside a KL trust region
+#   eta and alpha are **learned** Lagrangian multipliers; init_* below are only seeds.
+
+default:
+  note: >
+    code defaults. num_epochs is 8 rather than the paper's 1 -- the E-step uses only
+    half the samples, so 1 epoch under-trains badly (measured CartPole return 29 vs 179)
+
+classic:
+  note: measured -- CartPole-v1, 100k steps, seed=1, return ~150 (random ~20)
+  total_steps: 100000
+
+mujoco:
+  note: >
+    entirely unverified. The V-MPO paper used a large distributed setup, so a
+    single-machine small-batch configuration may not be comparable
+  num_envs: 16
+  norm_obs: true
+  norm_reward: true

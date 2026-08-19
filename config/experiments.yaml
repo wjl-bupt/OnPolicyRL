@@ -1,0 +1,56 @@
+# Experiment orchestration. One section = one batch of experiments.
+#
+#   oprl sweep classic --dry-run     # print the runs first
+#   oprl sweep classic
+#   oprl sweeps                      # list every sweep
+#
+# Default scheduling: **environments run one at a time, seeds of one environment run in
+# parallel**, with adaptive GPU selection (pick the card with the most projected free
+# memory that still fits; queue instead of overcommitting into an OOM).
+# Use `mode: serial` on a shared server to avoid contending for resources.
+
+classic:
+  note: quick sanity check on classic control; runs on CPU
+  algo: ppo
+  config: classic
+  envs: [CartPole-v1, Acrobot-v1]
+  seeds: [1, 2, 3]
+  max_parallel: 3
+
+mujoco:
+  note: hyperparameters not reproduced here yet; Humanoid gets a longer budget
+  algo: ppo
+  config: mujoco
+  envs: [HalfCheetah-v5, Walker2d-v5, Ant-v5, Humanoid-v5]
+  seeds: [1, 2, 3, 4, 5]
+  max_parallel: 5
+  per_run_mb: 1500
+  per_env:
+    Humanoid-v5: {total_steps: 10000000}
+
+surrogate_ablation:
+  note: compare surrogate variants on one environment
+  algo: ppo
+  config: classic
+  envs: [CartPole-v1]
+  seeds: [1, 2, 3]
+  max_parallel: 3
+  overrides: {surrogate: dpo}
+
+shared_server:
+  note: fully sequential -- avoids resource contention on a shared machine
+  algo: ppo
+  config: classic
+  envs: [CartPole-v1]
+  seeds: [1, 2, 3]
+  mode: serial
+
+smoke:
+  note: tiny scale, used to verify the orchestration itself (CI)
+  algo: ppo
+  config: classic
+  envs: [CartPole-v1, Acrobot-v1]
+  seeds: [1, 2]
+  max_parallel: 2
+  poll_seconds: 0.5
+  overrides: {total_steps: 4096, num_envs: 4, rollout_len: 32, device: cpu}

@@ -129,7 +129,7 @@ def _cmd_train(args, unknown: list[str]) -> int:
     if args.config:
         print(f"[oprl] config: {args.config}")
     if getattr(env, "preset", None) is not None:
-        print(f"[oprl] env preset: {env.preset.name} — {env.preset.note}")
+        print(f"[oprl] env preset: {env.preset.name} -- {env.preset.note}")
     print(cfg.describe())
 
     mod.train(cfg, env, policy, Logger(run_dir=run_dir))

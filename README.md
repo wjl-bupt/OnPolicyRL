@@ -96,9 +96,22 @@ buffer:
 
 A class referenced via `from` **inherits nothing and needs no registration** -- it only
 has to satisfy the relevant protocol. `shape` accepts symbolic sizes (`n_actions`,
-`obs_dim`) so configs need not hard-code environment dimensions. See
-[examples/my_components.py](examples/my_components.py) for working implementations, and
-`uv run oprl components` for the list of built-ins.
+`obs_dim`) so configs need not hard-code environment dimensions.
+Run `uv run oprl components` for the list of built-ins you are replacing.
+
+Two places to look for working code:
+
+- **[`diy/`](diy/)** -- bring-your-own algorithms. [`diy/spo/`](diy/spo/) reimplements
+  SPO (ICML 2025) in one standalone file that imports nothing from oprl, and
+  `tests/test_diy.py` asserts it is **numerically identical** to the built-in `spo`
+  surrogate. That makes the DIY path a verified equal, not an illustration.
+- **[`examples/my_components.py`](examples/my_components.py)** -- one file touching all
+  five extension points at once (encoder, advantage, policy loss, value loss, buffer field).
+
+```bash
+python diy/spo/spo.py                               # component self-check, no env needed
+uv run oprl train ppo --config diy/spo/config.yaml  # train with it
+```
 
 ## Experiment orchestration
 
@@ -166,6 +179,9 @@ config/                    hyperparameters, one file per algorithm
 ├─ ppo.yaml                default / classic / mujoco / atari / minatar / a2c
 ├─ vmpo.yaml               default / classic / mujoco
 └─ experiments.yaml        sweep definitions
+
+diy/                       bring-your-own algorithms; nothing here is imported by oprl
+└─ spo/                    SPO reimplemented standalone, cross-checked against built-in
 ```
 
 Two architectural rules, checked automatically by `tests/test_architecture.py`:
@@ -261,14 +277,15 @@ opaque config black box.
 ```
 tests/
 ├─ test_architecture.py   discipline: dependency direction, budget, protocol size, config drift
+├─ test_diy.py            the diy/ examples, incl. DIY-vs-built-in numerical equivalence
 ├─ unit/                  primitives: test_gae.py  test_buffer.py  test_config.py
 │                                     test_plugin.py  test_experiment.py
 └─ algos/                 algorithms: test_train.py  test_surrogates.py
 ```
 
 ```bash
-uv run pytest -m "not slow"   # 95 tests, ~4s
-uv run pytest                 # 104 tests including real CartPole learning checks, ~80s
+uv run pytest -m "not slow"   # 104 tests, ~15s
+uv run pytest                 # 114 tests including real CartPole learning checks, ~95s
 ```
 
 The learning tests are not smoke tests: they assert PPO, V-MPO and every surrogate beat a

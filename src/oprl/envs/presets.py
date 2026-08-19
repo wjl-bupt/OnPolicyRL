@@ -64,7 +64,7 @@ class EnvPreset:
 
 CLASSIC = EnvPreset(
     name="classic",
-    note="CartPole / Acrobot / Pendulum / LunarLander -- stats only, no preprocessing",
+    note="CartPole / Acrobot / Pendulum / LunarLander: stats only, no preprocessing",
 )
 
 MUJOCO = EnvPreset(

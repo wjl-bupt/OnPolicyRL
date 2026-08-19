@@ -147,3 +147,16 @@ def test_config_files_stay_small():
     assert len(files) <= 5, f"config/ has {len(files)} files; group them by algorithm"
     total = sum(len(f.read_text(encoding="utf-8").splitlines()) for f in files)
     assert total <= 250, f"config/ totals {total} lines, over budget"
+
+
+def test_src_does_not_import_diy():
+    """`diy/` is user territory -- the framework must never depend on it.
+
+    If src/ ever imports from diy/, the examples stop being optional and deleting one
+    breaks the install.
+    """
+    for f in sorted(SRC.rglob("*.py")):
+        for mod in _imports(f):
+            assert "diy" not in mod.split("."), (
+                f"{f.relative_to(SRC)} imports from diy/: {mod}"
+            )

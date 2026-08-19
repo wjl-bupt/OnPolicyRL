@@ -1,0 +1,29 @@
+# A DIY run configuration: pass this file directly to --config.
+#
+#   uv run oprl train ppo --config diy/spo/config.yaml
+#
+# Unlike config/ppo.yaml this is a flat set of hyperparameters, not sections -- the same
+# shape as the config a run persists to disk, which is why `--config runs/x/config.yaml`
+# also replays.
+#
+# Paths in `from:` are resolved from the current working directory, so run this from the
+# repository root.
+
+note: DIY SPO example; verified against the built-in `spo` surrogate by tests/test_diy.py
+
+# Point at the local implementation. `beta` goes to SimplePolicyOptimization.__init__,
+# not to PPOConfig.
+surrogate: {from: ./diy/spo/spo.py:SimplePolicyOptimization, beta: 1.0}
+
+# Everything below is ordinary PPO configuration (matches the `classic` preset).
+total_steps: 100000
+num_envs: 8
+rollout_len: 128
+num_epochs: 4
+num_minibatches: 4
+lr: 3.0e-4
+ent_coef: 0.01
+
+# SPO replaces the clipped policy objective, but `clip_vloss` still governs the *value*
+# loss and defaults to true. The value clip range reuses clip_coef.
+clip_coef: 0.2

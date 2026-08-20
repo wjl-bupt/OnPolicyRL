@@ -61,6 +61,7 @@ class ActorCritic(nn.Module):
         activation: str = "tanh",
         share_encoder: bool = False,
         log_std_init: float = 0.0,
+        advantage_head: bool = False,
     ):
         super().__init__()
         self.action_space = action_space
@@ -82,6 +83,16 @@ class ActorCritic(nn.Module):
         # Small-std init for the policy head (another known-important PPO detail).
         self.pi_head = orthogonal_init(nn.Linear(d, self.act_dim), std=0.01)
         self.v_head = orthogonal_init(nn.Linear(self.v_encoder.out_dim, 1), std=1.0)
+
+        # Optional per-action advantage head, requested by estimators such as DAE via
+        # `extra_policy_outputs`. Discrete actions only: it needs one output per action.
+        self.has_advantage_head = bool(advantage_head)
+        if self.has_advantage_head:
+            if not self.discrete:
+                raise ValueError("advantage_head requires a Discrete action space")
+            self.adv_head = orthogonal_init(
+                nn.Linear(self.v_encoder.out_dim, self.act_dim), std=0.01
+            )
 
         if not self.discrete:
             # State-independent log_std -- the standard choice on MuJoCo.
@@ -131,11 +142,12 @@ class ActorCritic(nn.Module):
                 )
             else:
                 encoder = build("encoder", enc_spec)
-        unknown = set(d) - {"share_encoder", "log_std_init"}
+        unknown = set(d) - {"share_encoder", "log_std_init", "advantage_head"}
         if unknown:
             raise ValueError(
                 f"unknown network options {sorted(unknown)}; available: "
-                "encoder, hidden, activation, share_encoder, log_std_init, from"
+                "encoder, hidden, activation, share_encoder, log_std_init, "
+                "advantage_head, from"
             )
         return cls(obs_space, action_space, encoder=encoder, hidden=hidden,
                    activation=activation, **d)
@@ -192,3 +204,24 @@ class ActorCritic(nn.Module):
     def dist(self, obs: Obs):
         f_pi, _ = self._feat(obs)
         return self._dist(f_pi)
+
+    # ---------------- optional advantage head (DAE) ----------------
+
+    def advantages(self, obs: Obs, probs: Tensor) -> tuple[Tensor, Tensor]:
+        """Per-action advantages plus the state value, for DAE-style estimators.
+
+        The raw head output is centred so that E_{a~pi}[A(s,a)] == 0 exactly, which is the
+        defining property of an advantage function. Without this projection the head could
+        absorb an arbitrary state-dependent offset and stop being an advantage at all.
+
+        Returns:
+            (advantages [B, n_actions], values [B])
+        """
+        if not self.has_advantage_head:
+            raise RuntimeError(
+                "this policy has no advantage head; build it with advantage_head=True"
+            )
+        _, f_v = self._feat(obs)
+        raw = self.adv_head(f_v)
+        centred = raw - (probs * raw).sum(-1, keepdim=True)
+        return centred, self.v_head(f_v).squeeze(-1)

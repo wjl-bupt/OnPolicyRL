@@ -22,6 +22,7 @@ from ..metrics import Timer, explained_variance
 from ..norm import ObsNormalizer, RewardNormalizer
 from ..objectives import get_surrogate, get_value_loss
 from ..rollout import collect
+from ..seeding import seed_everything
 from ..types import EnvAdapter, Policy
 
 
@@ -49,6 +50,8 @@ class PPOConfig(Config):
     advantage: Any = "gae"       # advantage estimator: gae|vtrace_free_mc
     value_loss: Any = "clipped"  # value loss: clipped|mse|huber
     network: Any = None          # network: {hidden:[...], encoder:..., from:...}
+    # Epochs for an estimator's iteration_loss (DAE). 0 = reuse num_epochs.
+    num_epochs_critic: int = 0
     buffer: Any = None           # extra buffer fields: {extra: {name: {shape, dtype}}}
 
     # --- Per-surrogate hyperparameters, listed explicitly rather than hidden in kwargs ---
@@ -72,7 +75,10 @@ def buffer_extra(cfg: PPOConfig, estimator, env) -> dict:
 
     spec = (cfg.buffer or {}).get("extra") if isinstance(cfg.buffer, dict) else None
     declared = schema_from_config(spec, env_symbols(env.obs_space, env.action_space))
-    from_est = getattr(estimator, "extra_fields", None) or {}
+    # Env-dependent field shapes take priority over the estimator's static declaration.
+    from_est = dict(getattr(estimator, "extra_fields", None) or {})
+    if hasattr(estimator, "resolve_fields"):
+        from_est.update(estimator.resolve_fields(env.obs_space, env.action_space) or {})
     dup = set(declared) & set(from_est)
     if dup:
         raise ValueError(f"buffer.extra collides with estimator fields: {sorted(dup)}")
@@ -140,6 +146,9 @@ def train(
     estimator=None,
 ) -> Policy:
     device = cfg.resolve_device()
+    # Seed everything before any parameter is created: cfg.seed must determine the whole
+    # run, not just the environment (see oprl/seeding.py).
+    seed_everything(cfg.seed, cfg.deterministic)
     log = log or Logger(run_dir=cfg.run_dir)
     timer = Timer()
     estimator = get_estimator(estimator or cfg.advantage, cfg)
@@ -171,7 +180,8 @@ def train(
             for g in opt.param_groups:
                 g["lr"] = frac * cfg.lr
 
-        obs, steps = collect(env, policy, buf, obs, log, timer, obs_norm, reward_norm)
+        obs, steps = collect(env, policy, buf, obs, log, timer, obs_norm, reward_norm,
+                             extra_writer=getattr(estimator, "write_extra", None))
         global_step += steps
 
         adv, ret, diag = estimator.compute(
@@ -181,6 +191,22 @@ def train(
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         buf.advantages, buf.returns = adv, ret
         log.add(**diag)
+
+        # Estimators whose objective needs contiguous time (DAE's telescoping residual)
+        # get one optimization pass over the whole rollout, before the minibatch loop
+        # shuffles the time axis away.
+        it_loss_fn = getattr(estimator, "iteration_loss", None)
+        if it_loss_fn is not None:
+            for _ in range(cfg.num_epochs_critic or cfg.num_epochs):
+                out = it_loss_fn(policy, buf, cfg)
+                if out is None:
+                    break
+                it_loss, it_stats = out
+                opt.zero_grad(set_to_none=True)
+                it_loss.backward()
+                nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+                opt.step()
+                log.add(**it_stats)
 
         stop = False
         for epoch in range(cfg.num_epochs):

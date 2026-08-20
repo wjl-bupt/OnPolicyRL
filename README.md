@@ -158,7 +158,8 @@ src/oprl/
 ├─ experiment.py           sweep orchestration and GPU scheduling
 ├─ advantages/             pluggable advantage estimators
 │   ├─ base.py                 protocol + registry (no concrete algorithm)
-│   └─ gae.py                  GAE  <- later: dae.py / rvl.py / ga2e.py
+│   ├─ gae.py                  GAE / Monte-Carlo
+│   └─ dae.py                  DAE (NeurIPS 2022)  <- later: rvl.py / ga2e.py
 ├─ objectives/             pluggable objectives
 │   ├─ ppo_family.py           PPO / TR-PPO / SPO / DPO / MDPO / RPE / APO
 │   └─ value_loss.py           clipped / mse / huber
@@ -208,7 +209,7 @@ algorithms, not algorithms themselves.** Putting them in `algos/` would break th
 | `algos.ppo` | PPO (plus `a2c_config()`), pluggable surrogate / advantage / value loss |
 | `algos.vmpo` | V-MPO (ICLR 2020): E-step plus learned Lagrangian multipliers |
 | `objectives.ppo_family` | **7 published objectives**, ~15 lines each |
-| `advantages` | Advantage estimator registry |
+| `advantages` | Registry plus GAE and **DAE** (Direct Advantage Estimation) |
 
 Discrete and continuous action spaces both verified (CartPole / Pendulum).
 
@@ -230,6 +231,26 @@ take 7 copy-pasted files.
 A random policy scores about 20. **These are not paper reproductions** -- single seed,
 CartPole only, untuned. They exist to verify each implementation actually learns.
 Serious comparisons need multiple seeds on MuJoCo; see DESIGN.md §10.
+
+### Advantage estimators
+
+| estimator | paper | CartPole @ 60k, 3 seeds (mean ± sd) |
+|---|---|---|
+| `gae` | Schulman et al. 2015 (baseline) | **223.4 ± 24.9** |
+| `dae` | Direct Advantage Estimation, NeurIPS 2022 | 206.0 ± 41.6 (`horizon=32`) |
+
+DAE inverts GAE's dependency: a head predicts the advantage **directly**, and the value
+function is fit to be consistent with it through a telescoping residual over each
+trajectory. It therefore owns its own critic loss -- advantage and value learning are one
+optimization, not two. `uv run oprl train ppo --config dae`
+
+**DAE does not beat GAE on CartPole here.** The paper's gains are reported on Atari, which
+this framework has not run yet, so treat the implementation as functional but not
+validated. Shorter horizons are worse and far less stable (`h=8` scored 275 on one seed and
+~50 on two others -- a spread that makes single-seed comparisons actively misleading).
+
+Discrete actions only (the head needs one output per action). It is orthogonal to the
+surrogate axis, so `--surrogate dpo --advantage dae` composes.
 
 **LPO / Mirror Learning is not implemented**: it is a theoretical framework whose
 instance uses a meta-learned neural drift, not a closed form. DPO is the closed-form
@@ -284,8 +305,8 @@ tests/
 ```
 
 ```bash
-uv run pytest -m "not slow"   # 104 tests, ~15s
-uv run pytest                 # 114 tests including real CartPole learning checks, ~95s
+uv run pytest -m "not slow"   # 118 tests, ~18s
+uv run pytest                 # 129 tests including real CartPole learning checks, ~110s
 ```
 
 The learning tests are not smoke tests: they assert PPO, V-MPO and every surrogate beat a
@@ -293,6 +314,6 @@ random policy on CartPole, which catches algorithmic regressions rather than syn
 
 ## Not yet implemented
 
-`SequenceSampler` (recurrent policies), DAE / RVL / GA2E estimators, `oprl.results` and
+`SequenceSampler` (recurrent policies), RVL / GA2E estimators, `oprl.results` and
 `oprl.plot` (the metrics -> archive -> figure pipeline), and real-hardware validation of
 `TensorEnvAdapter` on Isaac / Brax. Roadmap in DESIGN.md §11.

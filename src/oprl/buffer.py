@@ -35,6 +35,43 @@ class Minibatch(dict):
         return sub
 
 
+class TrajectoryBatch:
+    """A batch of whole trajectories, concatenated flat.
+
+    `lengths` lets a consumer recover per-trajectory views via `tensor.split(lengths)`.
+    `last_values` holds V(s_end) per trajectory, already zeroed where the trajectory ended
+    on a true termination (no future value to bootstrap from).
+    """
+
+    __slots__ = ("fields", "lengths", "last_values")
+
+    def __init__(self, fields: dict[str, Tensor], lengths: list[int],
+                 last_values: Tensor):
+        self.fields = fields
+        self.lengths = lengths
+        self.last_values = last_values
+
+    def __getitem__(self, k: str) -> Tensor:
+        return self.fields[k]
+
+    def __contains__(self, k: str) -> bool:
+        return k in self.fields
+
+    @property
+    def obs(self) -> Obs:
+        if "obs" in self.fields:
+            return self.fields["obs"]
+        return {k[4:]: v for k, v in self.fields.items() if k.startswith("obs.")}
+
+    @property
+    def n_frames(self) -> int:
+        return sum(self.lengths)
+
+    def split(self, key: str) -> tuple[Tensor, ...]:
+        """Per-trajectory views of one field."""
+        return self.fields[key].split(self.lengths)
+
+
 class RolloutBuffer:
     """Fixed [T, N] layout. No variable-length episodes, no prioritized sampling and
     no CPU paging -- on-policy training does not need any of it."""
@@ -196,6 +233,93 @@ class RolloutBuffer:
         # Flat indices, needed by e.g. V-MPO to slice the full pi_old distribution.
         mb["_flat_idx"] = sel
         return mb
+
+    # ---------------- trajectory view ----------------
+
+    def segments(self) -> list[tuple[int, int, int]]:
+        """Split [T, N] into contiguous trajectory segments.
+
+        Returns a list of (env_index, start_t, end_t) with end exclusive. A segment ends
+        at a termination, a truncation, an autoreset dummy step, or the rollout boundary.
+
+        This is a **view over the same storage**, not a second buffer. Estimators whose
+        objective needs contiguous time (DAE's telescoping residual) index through these
+        segments; nothing is copied or reallocated.
+        """
+        ended = (self._buf["terminated"][: self.T].bool()
+                 | self._buf["truncated"][: self.T].bool())
+        invalid = ~self._buf["valid"][: self.T].bool()
+        out: list[tuple[int, int, int]] = []
+        for n in range(self.N):
+            start = None
+            for t in range(self.T):
+                if invalid[t, n]:
+                    # A dummy step belongs to no trajectory: close any open segment.
+                    if start is not None:
+                        out.append((n, start, t))
+                        start = None
+                    continue
+                if start is None:
+                    start = t
+                if ended[t, n]:
+                    out.append((n, start, t + 1))
+                    start = None
+            if start is not None:
+                out.append((n, start, self.T))
+        return out
+
+    def iter_trajectories(self, batch_frames: int | None = None, generator=None):
+        """Yield batches of **whole trajectories**, shuffled.
+
+        Unlike `iter_minibatches`, which flattens time away, this preserves contiguity
+        within each trajectory -- the requirement for telescoping / n-step objectives.
+
+        Args:
+            batch_frames: approximate number of transitions per batch. None = one batch
+                containing every trajectory.
+
+        Yields:
+            `TrajectoryBatch` with flat, concatenated tensors plus `lengths`, so a consumer
+            can `split(lengths)` to recover per-trajectory views.
+        """
+        segs = self.segments()
+        if not segs:
+            return
+        order = torch.randperm(len(segs), generator=generator).tolist()
+        target = batch_frames or (self.T * self.N)
+
+        batch: list[tuple[int, int, int]] = []
+        frames = 0
+        for i in order:
+            seg = segs[i]
+            batch.append(seg)
+            frames += seg[2] - seg[1]
+            if frames >= target:
+                yield self._gather_trajs(batch)
+                batch, frames = [], 0
+        if batch:
+            yield self._gather_trajs(batch)
+
+    def _gather_trajs(self, segs: list[tuple[int, int, int]]) -> TrajectoryBatch:
+        lengths = [e - s for _, s, e in segs]
+        fields: dict[str, Tensor] = {}
+        for name, f in self.schema.items():
+            if f.sample_op is Op.WHOLE:
+                fields[name] = self._buf[name]
+                continue
+            buf = self._buf[name]
+            fields[name] = torch.cat([buf[s:e, n] for n, s, e in segs], dim=0)
+        # V(s_end) for each trajectory: the stored value one step past its end, which is
+        # the bootstrap slot when the trajectory runs to the rollout boundary.
+        vbuf = self._buf["value"]
+        last_values = torch.stack([vbuf[e, n] for n, s, e in segs])
+        # A trajectory that ended on a real termination has no future value.
+        term = self._buf["terminated"][: self.T].bool()
+        ended = torch.tensor(
+            [bool(term[e - 1, n]) for n, s, e in segs], device=self.device
+        )
+        last_values = torch.where(ended, torch.zeros_like(last_values), last_values)
+        return TrajectoryBatch(fields=fields, lengths=lengths, last_values=last_values)
 
     def describe(self) -> str:
         """The schema is printable, so "what is in this buffer" is answerable."""

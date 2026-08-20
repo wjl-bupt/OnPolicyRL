@@ -29,6 +29,7 @@ from ..logger import Logger
 from ..metrics import Timer, explained_variance
 from ..norm import ObsNormalizer, RewardNormalizer
 from ..rollout import collect
+from ..seeding import seed_everything
 from ..tree import tree_flatten_time
 from ..types import EnvAdapter, Policy
 
@@ -215,6 +216,9 @@ def train(
     estimator=None,
 ) -> Policy:
     device = cfg.resolve_device()
+    # Seed everything before any parameter is created: cfg.seed must determine the whole
+    # run, not just the environment (see oprl/seeding.py).
+    seed_everything(cfg.seed, cfg.deterministic)
     log = log or Logger(run_dir=cfg.run_dir)
     timer = Timer()
     estimator = get_estimator(estimator or cfg.advantage, cfg)

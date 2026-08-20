@@ -27,6 +27,7 @@ def collect(
     timer: Timer | None = None,
     obs_norm=None,
     reward_norm=None,
+    extra_writer=None,
 ) -> tuple[Obs, int]:
     """Collect one rollout. Returns (last obs, environment steps consumed).
 
@@ -44,6 +45,12 @@ def collect(
 
         buf.write_obs(norm_obs)
         buf.write(action=action, logprob=logp, value=value)
+        # Estimator-declared fields (e.g. DAE's full action distribution) are written by
+        # a callback, so `collect` stays agnostic about which estimator is in use.
+        if extra_writer is not None:
+            extra = extra_writer(policy, norm_obs)
+            if extra:
+                buf.write(**extra)
 
         with (timer("env") if timer else _null()):
             obs, reward, masks, info = env.step(action)

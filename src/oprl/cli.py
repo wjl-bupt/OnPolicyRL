@@ -95,6 +95,11 @@ def _cmd_train(args, unknown: list[str]) -> int:
     from .envs import make_env
     from .logger import Logger
     from .nets import ActorCritic
+    from .seeding import seed_everything
+
+    # Seed before constructing the policy, so network init is part of what cfg.seed
+    # determines. train() seeds again for the update loop.
+    seed_everything(cfg.seed, cfg.deterministic)
 
     env_spec = base.get("env") if isinstance(base.get("env"), dict) else {}
     env = make_env(

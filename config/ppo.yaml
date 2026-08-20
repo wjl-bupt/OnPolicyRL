@@ -52,3 +52,14 @@ a2c:                # A2C is not a separate algorithm, just a PPO configuration
   clip_vloss: false
   lr: 7.0e-4
   ent_coef: 0.01
+
+dae:                # Direct Advantage Estimation (NeurIPS 2022), discrete actions only
+  note: >
+    measured CartPole-v1 60k steps, 3 seeds: 206 +- 42 vs GAE 223 +- 25.
+    So DAE does NOT beat GAE here; the paper's gains are on Atari, which this
+    framework has not run yet. Treat as functional, not validated.
+  total_steps: 100000
+  num_epochs: 4
+  ent_coef: 0.01
+  advantage: {name: dae, horizon: 32}
+  network: {advantage_head: true}     # DAE needs a per-action advantage head

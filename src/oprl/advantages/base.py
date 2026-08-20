@@ -80,6 +80,16 @@ class BaseEstimator:
     def critic_loss(self, policy, mb, cfg):
         return None
 
+    def resolve_fields(self, obs_space, act_space) -> Schema:
+        """Extra buffer fields whose shape depends on the env (see DAE). Defaults to the
+        static `extra_fields`."""
+        return {}
+
+    def iteration_loss(self, policy, buf, cfg):
+        """A loss computed once per iteration over the whole rollout, for estimators whose
+        objective needs contiguous time (see DAE's telescoping residual). None = skip."""
+        return None
+
     def on_epoch_start(self, epoch, buf, policy=None, surrogate=None, cfg=None):
         pass
 

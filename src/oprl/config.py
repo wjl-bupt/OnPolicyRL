@@ -39,6 +39,9 @@ class Config:
     log_interval: int = 1
     run_dir: str | None = None
     smoke: bool = False
+    # Force deterministic kernels. Off by default: it costs throughput and some ops
+    # have no deterministic implementation.
+    deterministic: bool = False
 
     def resolve_device(self) -> torch.device:
         if self.device == "auto":

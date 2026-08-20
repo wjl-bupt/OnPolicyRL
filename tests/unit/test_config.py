@@ -92,3 +92,52 @@ def test_runtime_fields_not_exported():
     cfg = PPOConfig()
     cfg._progress = 0.5
     assert "_progress" not in cfg.to_dict()
+
+
+def test_seed_determines_whole_run():
+    """`cfg.seed` must determine network init, not just the environment.
+
+    This test exists because it did not: a DAE learning test passed in isolation and
+    failed inside the full suite, because policy initialization was reading whatever
+    global torch RNG state the previous test happened to leave behind.
+    """
+    import torch
+
+    import oprl
+
+    def first_weight(seed):
+        oprl.seed_everything(seed)
+        env = oprl.make_env("CartPole-v1", num_envs=2, seed=seed)
+        p = oprl.ActorCritic(env.obs_space, env.action_space)
+        env.close()
+        return next(p.parameters()).detach().clone()
+
+    a, b, c = first_weight(1), first_weight(1), first_weight(2)
+    assert torch.equal(a, b), "same seed must give identical initialization"
+    assert not torch.equal(a, c), "different seeds must give different initialization"
+
+
+def test_train_is_order_independent():
+    """Two identical configs must produce identical results regardless of what ran before."""
+    import torch
+
+    import oprl
+    from oprl.algos import ppo
+
+    def run():
+        # `train()` seeds on entry, which covers the update loop. The policy itself is
+        # built by the caller, so the caller seeds too -- exactly what oprl.cli does.
+        oprl.seed_everything(7)
+        env = oprl.make_env("CartPole-v1", num_envs=4, seed=1)
+        p = oprl.ActorCritic(env.obs_space, env.action_space)
+        cfg = ppo.PPOConfig(total_steps=4 * 32 * 2, num_envs=4, rollout_len=32,
+                            device="cpu", num_epochs=2, seed=7)
+        ppo.train(cfg, env, p, oprl.Logger(sinks=[]))
+        env.close()
+        return next(p.parameters()).detach().clone()
+
+    first = run()
+    torch.manual_seed(999)          # perturb global RNG, as another test would
+    _ = torch.randn(1000)
+    second = run()
+    assert torch.equal(first, second), "training must not depend on prior RNG state"

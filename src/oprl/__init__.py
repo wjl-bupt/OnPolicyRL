@@ -35,6 +35,7 @@ from .norm import ObsNormalizer, RewardNormalizer, RunningMeanStd
 from .objectives import Surrogate, get_surrogate
 from .rollout import collect
 from .schema import Field, Op, Schema, base_schema
+from .seeding import load_rng_state, rng_state, seed_everything
 from .types import EnvAdapter, Masks, Obs, Policy, RState
 
 __version__ = "0.1.0"
@@ -52,6 +53,7 @@ __all__ = [
     "ActorCritic",
     # runtime
     "Config", "Timer", "collect", "explained_variance",
+    "seed_everything", "rng_state", "load_rng_state",
     "Logger", "Sink", "ConsoleSink", "JsonlSink",
     "ObsNormalizer", "RewardNormalizer", "RunningMeanStd",
     "GymVecAdapter", "TensorEnvAdapter", "make_env",

@@ -12,9 +12,10 @@ from .base import (
     get_estimator,
     register,
 )
+from .dae import DAE
 from .gae import GAE, MonteCarloAdvantage, gae
 
 __all__ = [
     "AdvantageEstimator", "BaseEstimator", "register", "get_estimator", "ESTIMATORS",
-    "gae", "GAE", "MonteCarloAdvantage",
+    "gae", "GAE", "MonteCarloAdvantage", "DAE",
 ]

@@ -106,13 +106,20 @@ src/oprl/
 │   └─ gym_vec.py              GymVecAdapter / TensorEnvAdapter / make_env
 │
 ├─ algos/              L2  一个更新规则 = 一个文件
-│   ├─ ppo.py                  （a2c_config() 也在这里 —— A2C 是它的一组超参）
+│   ├─ base.py                 算法注册表：Algo 记录 + @algo / alias
+│   ├─ _common.py              setup / begin_iteration / log_iteration（只有样板）
+│   ├─ ppo.py                  （a2c 注册为它的 alias —— A2C 是它的一组超参）
 │   └─ vmpo.py
-└─ cli.py              L3  oprl train / oprl configs
+└─ cli.py              L3  oprl train / configs / sweep / algos / components
 
 config/                    超参：一个算法一个文件，一族环境一个小节
 ├─ ppo.yaml                default / classic / mujoco / atari / minatar / a2c
 └─ vmpo.yaml               default / classic / mujoco
+
+diy/                       用户组件；按扩展点分目录，框架不 import 它
+├─ surrogates/spo.py       SPO 独立复现，与内建版数值交叉验证
+├─ advantages/ga2e.py      GA2E：梯度对齐选 λ（零框架改动接入）
+└─ algos/                  （空）全新的 train loop 放这里
 ```
 
 **两条架构纪律，由 `tests/test_architecture.py` 自动检查**：

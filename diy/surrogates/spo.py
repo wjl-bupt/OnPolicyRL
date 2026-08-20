@@ -3,22 +3,30 @@
 Paper:  Simple Policy Optimization (Xie & Zhang, ICML 2025)
         https://proceedings.mlr.press/v267/xie25m.html
 
-Idea: drop PPO's ratio clipping. Instead optimize an unconstrained objective that
-penalizes KL(pi_old || pi_new) directly, which bounds the trust region implicitly::
+Idea: drop PPO's ratio clipping. Instead optimize an unconstrained objective with an
+**advantage-weighted quadratic penalty** on the ratio, which bounds the trust region
+implicitly::
 
-    loss = -A * r  +  beta * KL(pi_old || pi_new)
+    loss = -mean( A*r  -  beta * |A| * (r - 1)^2 / (2*eps) )
 
-where r = pi_new/pi_old. The KL uses Schulman's k3 estimator::
+where r = pi_new/pi_old and eps = cfg.clip_coef.
 
-    KL_k3 = (r - 1) - log r
+Two details that are easy to get wrong:
 
-k3 is unbiased and **non-negative for every sample**, unlike the naive `-log r` estimator
-which is only non-negative in expectation and can therefore hand back a negative penalty
-on individual minibatches.
+**The whole expression is inside one mean.** The penalty carries a per-sample |A| factor, so
+a transition with a large advantage is pulled back toward r = 1 harder than one with a small
+advantage. Reducing the reward term and the penalty term separately throws that weighting
+away -- and multiplying a per-sample |A| onto an already-reduced `.mean()` yields a *vector*,
+not a scalar loss, which autograd will happily accept before failing somewhere less obvious.
 
-Why clipping is worth dropping: a clipped ratio has zero gradient outside the trust
-region, so a policy that overshoots gets no signal pulling it back -- it can sit there.
-A KL penalty always pushes back, proportionally to how far out it is.
+**`(r-1)^2 / 2` is the second-order expansion of Schulman's k3 KL estimator**,
+`KL_k3 = (r - 1) - log r`. So this is a KL penalty in all but name -- specifically an
+advantage-weighted one with coefficient 1/eps, rather than the uniform coefficient a plain
+k3 penalty would give.
+
+Why clipping is worth dropping: a clipped ratio has zero gradient outside the trust region,
+so a policy that overshoots gets no signal pulling it back -- it can sit there. A quadratic
+penalty always pushes back, proportionally to how far out it is.
 
 This file is a **standalone reimplementation** -- it imports nothing from oprl. The
 framework's own `spo` surrogate is in `src/oprl/objectives/ppo_family.py`, and
@@ -46,7 +54,7 @@ class SimplePolicyOptimization:
     def __init__(self, beta: float = 1.0, adaptive: bool = False, target_kl: float = 0.01):
         """
         Args:
-            beta: KL penalty coefficient. Larger = tighter trust region.
+            beta: penalty coefficient. Larger = tighter trust region.
             adaptive: scale beta per minibatch toward `target_kl` (a common trick from
                 the original PPO paper's KL-penalty variant, not from the SPO paper --
                 left off by default so the default path stays faithful to the paper).
@@ -60,25 +68,29 @@ class SimplePolicyOptimization:
     def __call__(
         self, ratio: Tensor, logp: Tensor, logp_old: Tensor, adv: Tensor, cfg
     ) -> tuple[Tensor, dict[str, float]]:
-        logratio = logp - logp_old
-
-        # k3 estimator: non-negative per sample, so the penalty never flips sign.
-        kl = (ratio - 1.0) - logratio
+        # Floored, as in the reference: the coefficient is 1/(2*eps), so a small clip_coef
+        # would otherwise silently turn into an enormous penalty.
+        eps = max(float(cfg.clip_coef), 1e-3)
 
         if self.adaptive:
             # Detached: the coefficient is a schedule, not something to backprop through.
+            # k3 is the quantity being targeted, so it is what the schedule watches.
             with torch.no_grad():
-                kl_mean = kl.mean().item()
+                logratio = logp - logp_old
+                kl_mean = ((ratio - 1.0) - logratio).mean().item()
                 if kl_mean > 1.5 * self.target_kl:
                     self._beta_cur = min(self._beta_cur * 1.5, 1e4)
                 elif kl_mean < self.target_kl / 1.5:
                     self._beta_cur = max(self._beta_cur / 1.5, 1e-4)
         beta = self._beta_cur if self.adaptive else self.beta
 
-        loss = (-adv * ratio + beta * kl).mean()
+        # One mean over the whole expression -- see the module docstring on why the
+        # per-sample |A| weighting cannot be factored out of it.
+        penalty = adv.abs() * (ratio - 1.0) ** 2 / (2.0 * eps)
+        loss = -(adv * ratio - beta * penalty).mean()
 
         return loss, {
-            "diag/kl_penalty": kl.mean().item(),
+            "diag/spo_penalty": penalty.mean().item(),
             "diag/spo_beta": beta,
             # No clipping happens, but reporting how far the ratio drifts keeps this
             # comparable with the clipped baselines.
@@ -101,14 +113,25 @@ if __name__ == "__main__":
 
     # Positive advantage must push this action's log-probability up, i.e. d(loss)/d(logp) < 0.
     loss, stats = loss_fn(logp.exp(), logp, logp_old, torch.ones(256), _Cfg())
+    assert loss.dim() == 0, f"loss must be a scalar, got shape {tuple(loss.shape)}"
     loss.backward()
     grad = logp.grad.sum().item()
     print(f"loss={loss.item():+.4f}  d(loss)/d(logp)={grad:+.4f}  {stats}")
     assert grad < 0, "sign error: a positive advantage must increase log-prob"
 
-    # At ratio == 1 the KL penalty must vanish exactly.
+    # At ratio == 1 the penalty must vanish exactly, or every update is biased even when the
+    # policy has not moved.
     loss0, stats0 = loss_fn(torch.ones(8), torch.zeros(8), torch.zeros(8),
-                            torch.zeros(8), _Cfg())
-    assert abs(stats0["diag/kl_penalty"]) < 1e-9, "KL must be 0 when pi_new == pi_old"
+                            torch.ones(8), _Cfg())
+    assert abs(stats0["diag/spo_penalty"]) < 1e-9, "penalty must be 0 when pi_new == pi_old"
+
+    # The penalty is weighted per sample by |A|: doubling the advantage must more than double
+    # it. If the |A| factor were pulled outside the mean, this would fail.
+    r = torch.full((8,), 1.3)
+    _, s1 = loss_fn(r, torch.zeros(8), torch.zeros(8), torch.ones(8), _Cfg())
+    _, s2 = loss_fn(r, torch.zeros(8), torch.zeros(8), torch.full((8,), 2.0), _Cfg())
+    assert abs(s2["diag/spo_penalty"] - 2 * s1["diag/spo_penalty"]) < 1e-6, (
+        "the penalty is not scaling with |A| -- the per-sample weighting was lost"
+    )
 
     print("self-check passed")

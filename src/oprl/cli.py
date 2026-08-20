@@ -1,12 +1,15 @@
 """CLI -- the L3 convenience layer.
 
     oprl train ppo --config mujoco --env HalfCheetah-v5 --lr 1e-4
-    oprl configs [algo]      list available presets
-    oprl sweep <name>        run a batch of experiments
-    oprl components          list pluggable components
+    oprl train ./diy/algos/my_algo.py:train --env CartPole-v1
+    oprl algos                list registered algorithms
+    oprl configs [algo]       list available presets
+    oprl sweep <name>         run a batch of experiments
+    oprl components           list pluggable components
 
 This module carries no algorithm knowledge: it never adjusts hyperparameters based on
-the env name. Those come only from config/ and the command line.
+the env name, and it does not enumerate algorithms. Both come from the registry and from
+config/ plus the command line.
 """
 
 from __future__ import annotations
@@ -20,13 +23,31 @@ from pathlib import Path
 from .config import load_dict, presets
 
 
-def _algo_module(name: str):
-    from .algos import ppo as ppo_mod
-    from .algos import vmpo as vmpo_mod
+def _resolve_algo(name: str):
+    """Look the algorithm up in the registry. Accepts a registered name or a
+    `./file.py:train` reference, so a new algorithm needs no edit to this file."""
+    import oprl.algos  # noqa: F401  triggers registration of the built-ins
 
-    if name == "vmpo":
-        return vmpo_mod, vmpo_mod.VMPOConfig
-    return ppo_mod, ppo_mod.PPOConfig
+    from .algos.base import get_algo
+
+    return get_algo(name)
+
+
+def _config_key(algo) -> str:
+    """Which config/<name>.yaml an algorithm reads.
+
+    Variants sharing a train() share its presets: `a2c` is an alias of `ppo`, so it reads
+    config/ppo.yaml rather than needing a file of its own.
+    """
+    from .algos.base import ALGOS
+    from .config import CONFIG_DIR
+
+    if (CONFIG_DIR / f"{algo.name}.yaml").is_file():
+        return algo.name
+    for other in ALGOS.values():
+        if other.train is algo.train and (CONFIG_DIR / f"{other.name}.yaml").is_file():
+            return other.name
+    return algo.name
 
 
 def _add_config_args(p: argparse.ArgumentParser, cfg_cls) -> None:
@@ -50,9 +71,26 @@ def _add_config_args(p: argparse.ArgumentParser, cfg_cls) -> None:
                        help=f"(default: {f.default})")
 
 
+def _cmd_algos(args) -> int:
+    """oprl algos -- list registered algorithms and how to add one."""
+    import oprl.algos  # noqa: F401
+
+    from .algos.base import ALGOS
+
+    print("algos:")
+    for name, a in sorted(ALGOS.items()):
+        extra = f"  [{', '.join(f'{k}={v}' for k, v in a.defaults.items())}]" if a.defaults else ""
+        print(f"  {name:<8} {a.config_cls.__name__:<12} {a.note}{extra}")
+    print("\n  usage: oprl train <algo> [--config preset] [--any_hyperparam value]")
+    print("  custom: oprl train ./my_algo.py:train   (any train(cfg, env, policy, log))")
+    return 0
+
+
 def _cmd_configs(args) -> int:
     """oprl configs [algo] -- list presets and their notes."""
-    algos = [args.algo] if args.algo else ["ppo", "vmpo"]
+    from .config import algo_names
+
+    algos = [args.algo] if args.algo else algo_names()
     for algo in algos:
         ps = presets(algo)
         if not ps:
@@ -70,24 +108,20 @@ def _cmd_configs(args) -> int:
 
 
 def _cmd_train(args, unknown: list[str]) -> int:
-    mod, cfg_cls = _algo_module(args.algo)
-    algo_key = "ppo" if args.algo in ("ppo", "a2c") else args.algo
+    algo = _resolve_algo(args.algo)
+    cfg_cls = algo.config_cls
 
-    # Precedence: dataclass defaults < YAML preset < CLI
+    # Precedence: dataclass defaults < algo defaults < YAML preset < CLI
     cfg_parser = argparse.ArgumentParser(add_help=False)
     _add_config_args(cfg_parser, cfg_cls)
     cfg_args, leftover = cfg_parser.parse_known_args(unknown)
     if leftover:
         raise SystemExit(f"unrecognized arguments: {leftover} (see --help)")
 
-    base: dict = load_dict(args.config, algo_key)
+    base: dict = load_dict(args.config, _config_key(algo))
     base.update({k: v for k, v in vars(cfg_args).items() if v is not None})
 
-    if args.algo == "a2c":
-        cfg = mod.a2c_config(**{k: v for k, v in base.items()
-                                if k in cfg_cls.field_names()})
-    else:
-        cfg = cfg_cls.from_dict(base)   # unknown hyperparameters raise here
+    cfg = algo.make_config(base)   # unknown hyperparameters raise here
 
     if cfg.smoke:
         cfg.total_steps = min(cfg.total_steps, cfg.rollout_len * cfg.num_envs * 3)
@@ -117,27 +151,27 @@ def _cmd_train(args, unknown: list[str]) -> int:
         if "norm_reward" not in base and p.suggest_norm_reward:
             cfg.norm_reward = True
 
-    net_spec = cfg.network
+    net_spec = cfg.network if hasattr(cfg, "network") else None
     if net_spec is None and args.hidden:
         net_spec = {"hidden": [int(x) for x in args.hidden.split(",")]}
     policy = ActorCritic.from_config(env.obs_space, env.action_space, net_spec).to(
         cfg.resolve_device()
     )
 
-    run_dir = Path(cfg.run_dir or f"runs/{args.algo}-{args.env}-seed{cfg.seed}")
+    run_dir = Path(cfg.run_dir or f"runs/{algo.name}-{args.env}-seed{cfg.seed}")
     run_dir.mkdir(parents=True, exist_ok=True)
     # Save the resolved config so it can be replayed via --config (DESIGN.md §2).
     cfg.save(run_dir / "config.yaml")
     (run_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2))
 
-    print(f"[oprl] {args.algo} on {args.env} | device={cfg.resolve_device()} | {run_dir}")
+    print(f"[oprl] {algo.name} on {args.env} | device={cfg.resolve_device()} | {run_dir}")
     if args.config:
         print(f"[oprl] config: {args.config}")
     if getattr(env, "preset", None) is not None:
         print(f"[oprl] env preset: {env.preset.name} -- {env.preset.note}")
     print(cfg.describe())
 
-    mod.train(cfg, env, policy, Logger(run_dir=run_dir))
+    algo.train(cfg, env, policy, Logger(run_dir=run_dir))
     env.close()
     return 0
 
@@ -173,6 +207,7 @@ def _cmd_sweeps(args) -> int:
 def _cmd_components(args) -> int:
     """List every pluggable component -- i.e. what a config may name."""
     import oprl.advantages  # noqa: F401  triggers registration
+    import oprl.algos  # noqa: F401
     import oprl.envs  # noqa: F401
     import oprl.nets  # noqa: F401
     import oprl.objectives  # noqa: F401
@@ -187,8 +222,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="oprl")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    # `algo` is a free-form string, not a fixed choice list: the registry decides what is
+    # valid, and a `./file.py:train` reference needs no registration at all.
     tr = sub.add_parser("train", help="train an algorithm")
-    tr.add_argument("algo", choices=["ppo", "a2c", "vmpo"])
+    tr.add_argument("algo", help="registered name (see `oprl algos`) or ./file.py:train")
     tr.add_argument("--env", default="CartPole-v1")
     tr.add_argument("--config", default=None,
                     help="preset name in config/<algo>.yaml (e.g. mujoco), "
@@ -196,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
     tr.add_argument("--hidden", default="64,64")
 
     cf = sub.add_parser("configs", help="list available presets")
-    cf.add_argument("algo", nargs="?", default=None, choices=["ppo", "vmpo"])
+    cf.add_argument("algo", nargs="?", default=None)
 
     sw = sub.add_parser("sweep", help="run a batch of experiments")
     sw.add_argument("name")
@@ -205,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
     sw.add_argument("--max-parallel", type=int, default=None)
 
     sub.add_parser("sweeps", help="list sweeps")
+    sub.add_parser("algos", help="list registered algorithms")
     sub.add_parser("components", help="list pluggable components")
 
     args, unknown = parser.parse_known_args(argv)
@@ -214,6 +252,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_sweep(args)
     if args.cmd == "sweeps":
         return _cmd_sweeps(args)
+    if args.cmd == "algos":
+        return _cmd_algos(args)
     if args.cmd == "components":
         return _cmd_components(args)
     return _cmd_train(args, unknown)

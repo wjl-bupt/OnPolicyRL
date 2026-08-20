@@ -12,9 +12,9 @@ loss = -A * r + beta * KL(pi_old || pi_new),    KL_k3 = (r - 1) - log r
 ## Run it
 
 ```bash
-python diy/spo/spo.py                                   # self-check, no env needed
-uv run oprl train ppo --config diy/spo/config.yaml      # train
-uv run oprl train ppo --config diy/spo/config.yaml --lr 1e-4   # CLI still overrides
+python diy/surrogates/spo.py                                   # self-check, no env needed
+uv run oprl train ppo --config diy/surrogates/spo.yaml      # train
+uv run oprl train ppo --config diy/surrogates/spo.yaml --lr 1e-4   # CLI still overrides
 ```
 
 ## What this example demonstrates

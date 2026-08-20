@@ -160,3 +160,45 @@ def test_src_does_not_import_diy():
             assert "diy" not in mod.split("."), (
                 f"{f.relative_to(SRC)} imports from diy/: {mod}"
             )
+
+
+def test_diy_layout_mirrors_registry_kinds():
+    """`diy/` is organized by component kind, so a reader can tell what an example *is*.
+
+    The previous layout was one directory per example (`diy/spo/`), which hid that `spo.py`
+    is a policy loss rather than an algorithm -- an important distinction, since the two have
+    very different protocols.
+    """
+    from oprl.registry import KINDS
+
+    # `surrogates` is the accepted directory name for the `policy_loss` kind: it is the term
+    # DESIGN.md §4.6 and the Surrogate protocol both use. Every other directory must be a
+    # kind name or its plural.
+    aliases = {"surrogates": "policy_loss"}
+    allowed = {k for k in KINDS} | {k + "s" for k in KINDS} | set(aliases)
+
+    diy = SRC.parents[1] / "diy"
+    subdirs = {p.name for p in diy.iterdir() if p.is_dir() and not p.name.startswith("_")}
+    unknown = subdirs - allowed
+    assert not unknown, (
+        f"diy/ has directories that are not component kinds: {sorted(unknown)}; "
+        f"kinds are {sorted(KINDS)} (alias: {aliases})"
+    )
+
+
+def test_algos_do_not_special_case_a_component_by_name():
+    """**Regression guard.** `ppo.py` used to read `cfg.surrogate == "apo"`, which silently
+    did nothing for the equivalent dict form `{name: apo}` -- UARR was skipped with no error.
+
+    Algorithms must dispatch on capability (an attribute check), never on the identity of a
+    particular component.
+    """
+    for f in sorted((SRC / "algos").glob("*.py")):
+        src = f.read_text(encoding="utf-8")
+        for kind in ("surrogate", "advantage", "value_loss"):
+            for op in ("==", "!="):
+                bad = f"cfg.{kind} {op}"
+                assert bad not in src, (
+                    f"{f.name} compares {bad!r} against a literal; dispatch on a capability "
+                    "attribute instead (see objectives/ppo_family.py:APOSurrogate)"
+                )

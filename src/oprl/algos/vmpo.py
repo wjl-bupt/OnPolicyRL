@@ -15,6 +15,7 @@ There is no ratio and no clipping, so none of ppo.py's objectives can be reused.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -22,16 +23,13 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.distributions import Categorical, Normal
 
-from ..advantages import get_estimator
-from ..buffer import RolloutBuffer
 from ..config import Config
 from ..logger import Logger
-from ..metrics import Timer, explained_variance
-from ..norm import ObsNormalizer, RewardNormalizer
 from ..rollout import collect
-from ..seeding import seed_everything
 from ..tree import tree_flatten_time
 from ..types import EnvAdapter, Policy
+from . import _common
+from .base import algo
 
 
 @dataclass
@@ -65,6 +63,10 @@ class VMPOConfig(Config):
 
     norm_obs: bool = False
     norm_reward: bool = False
+
+    # --- Pluggable components; `buffer` mirrors PPOConfig so config-declared extra
+    # fields work here too (they were previously ignored by this algorithm). ---
+    buffer: Any = None
 
 
 class VMPODuals(nn.Module):
@@ -208,6 +210,7 @@ def vmpo_loss(
     return total, stats
 
 
+@algo("vmpo", VMPOConfig, note="V-MPO (ICLR 2020): EM-style update with learned duals")
 def train(
     cfg: VMPOConfig,
     env: EnvAdapter,
@@ -215,44 +218,29 @@ def train(
     log: Logger | None = None,
     estimator=None,
 ) -> Policy:
-    device = cfg.resolve_device()
-    # Seed everything before any parameter is created: cfg.seed must determine the whole
-    # run, not just the environment (see oprl/seeding.py).
-    seed_everything(cfg.seed, cfg.deterministic)
-    log = log or Logger(run_dir=cfg.run_dir)
-    timer = Timer()
-    estimator = get_estimator(estimator or cfg.advantage, cfg)
+    # Mechanical setup is shared with ppo.py (see algos/_common.py); the update rule below
+    # is what makes this a separate file.
+    rt = _common.setup(cfg, env, policy, log, estimator)
+    log, timer, buf, estimator = rt.log, rt.timer, rt.buf, rt.estimator
 
     continuous = type(env.action_space).__name__ != "Discrete"
-    duals = VMPODuals(cfg, continuous).to(device)
+    duals = VMPODuals(cfg, continuous).to(rt.device)
 
-    obs_norm = ObsNormalizer(env.obs_space.shape, device) if cfg.norm_obs else None
-    reward_norm = (
-        RewardNormalizer(env.num_envs, cfg.gamma, device) if cfg.norm_reward else None
-    )
-
-    buf = RolloutBuffer(
-        cfg.rollout_len, env.num_envs, env.obs_space, env.action_space, device,
-        extra=getattr(estimator, "extra_fields", None) or None,
-    )
     # Multipliers and policy share one optimizer but follow their own dual losses.
     opt = torch.optim.Adam(
         list(policy.parameters()) + list(duals.parameters()), lr=cfg.lr, eps=1e-5
     )
 
-    batch = cfg.rollout_len * env.num_envs
-    n_iters = max(1, cfg.total_steps // batch)
     obs = env.reset(seed=cfg.seed)
     global_step = 0
     stats: dict = {}
 
-    for it in range(n_iters):
-        if cfg.anneal_lr:
-            frac = 1.0 - it / n_iters
-            for g in opt.param_groups:
-                g["lr"] = frac * cfg.lr
+    for it in range(rt.n_iters):
+        _common.begin_iteration(cfg, opt, it, rt.n_iters)
 
-        obs, steps = collect(env, policy, buf, obs, log, timer, obs_norm, reward_norm)
+        obs, steps = collect(env, policy, buf, obs, log, timer, rt.obs_norm,
+                             rt.reward_norm,
+                             extra_writer=getattr(estimator, "write_extra", None))
         global_step += steps
 
         adv, ret, diag = estimator.compute(buf, policy=policy, cfg=cfg)
@@ -285,16 +273,11 @@ def train(
                 opt.step()
                 _project_duals(duals, cfg)
 
-        if stats:
-            log.record("diag/explained_variance",
-                       explained_variance(stats["_value"], stats["_returns"]))
-        log.record("train/lr", opt.param_groups[0]["lr"])
-        log.add(**timer.drain())
+        _common.log_iteration(rt, opt, stats, steps)
         if it % cfg.log_interval == 0:
             log.dump(global_step)
 
-    log.dump(global_step)
-    log.close()
+    _common.finish(log, global_step)
     return policy
 
 

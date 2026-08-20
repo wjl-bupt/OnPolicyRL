@@ -27,7 +27,7 @@ from typing import Any
 # kind -> {name -> class/factory}
 REGISTRY: dict[str, dict[str, Any]] = {}
 
-KINDS = ("advantage", "policy_loss", "value_loss", "encoder", "env_preset")
+KINDS = ("algo", "advantage", "policy_loss", "value_loss", "encoder", "env_preset")
 
 
 def register(kind: str, name: str):
@@ -143,6 +143,33 @@ def describe() -> str:
         names = registered(kind)
         lines.append(f"{kind}:")
         lines.append(f"  {', '.join(names) if names else '(none)'}")
+        # Constructor parameters are where a component's own hyperparameters live (see
+        # objectives/ppo_family.py), so listing them keeps them discoverable now that they
+        # are no longer fields on the algorithm's Config.
+        for name in names:
+            params = _init_params(REGISTRY[kind][name])
+            if params:
+                lines.append(f"    {name}: {params}")
     lines.append("")
     lines.append("Custom: write {from: ./your_file.py:YourClass} in the config.")
     return "\n".join(lines)
+
+
+def _init_params(obj) -> str:
+    """Render a component's `__init__` keyword parameters as `name=default` pairs."""
+    import inspect
+
+    if not isinstance(obj, type):
+        return ""
+    try:
+        sig = inspect.signature(obj.__init__)
+    except (TypeError, ValueError):
+        return ""
+    out = []
+    for p in list(sig.parameters.values())[1:]:  # skip self
+        if p.name in ("cfg", "args", "kwargs") or p.kind in (
+            p.VAR_POSITIONAL, p.VAR_KEYWORD
+        ):
+            continue
+        out.append(f"{p.name}={p.default!r}" if p.default is not p.empty else p.name)
+    return ", ".join(out)

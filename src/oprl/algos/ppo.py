@@ -1,8 +1,13 @@
 """PPO -- flat, linear, readable top to bottom, with no base class.
 
-Every hyperparameter is listed explicitly in PPOConfig; none are hard-coded
-(DESIGN.md §4.6). A2C is just a config of this algorithm:
-num_epochs=1, num_minibatches=1, clip_coef=inf.
+Every framework-level hyperparameter is listed explicitly in PPOConfig; none are
+hard-coded (DESIGN.md §4.6). Hyperparameters belonging to a *swappable component* live on
+that component instead, reached through the config spec::
+
+    surrogate: {name: spo, beta: 2.0}
+
+which is the same convention a DIY component uses (see diy/README.md). A2C is just a
+config of this algorithm: num_epochs=1, num_minibatches=1, clip_coef=inf.
 """
 
 from __future__ import annotations
@@ -14,16 +19,16 @@ from typing import Any, Literal
 import torch
 import torch.nn as nn
 
-from ..advantages import get_estimator
-from ..buffer import RolloutBuffer
 from ..config import Config
 from ..logger import Logger
-from ..metrics import Timer, explained_variance
-from ..norm import ObsNormalizer, RewardNormalizer
 from ..objectives import get_surrogate, get_value_loss
 from ..rollout import collect
-from ..seeding import seed_everything
 from ..types import EnvAdapter, Policy
+from . import _common
+from ._common import buffer_extra  # re-exported: part of the public surface
+from .base import algo, alias
+
+__all__ = ["PPOConfig", "ppo_loss", "train", "a2c_config", "buffer_extra"]
 
 
 @dataclass
@@ -45,44 +50,19 @@ class PPOConfig(Config):
     norm_reward: bool = False
 
     # --- Pluggable components (DESIGN.md §4.6 / §4.7) ---
-    # Three accepted forms: a name, {name: ..., kwargs}, or {from: ./my.py:MyClass}
+    # Three accepted forms: a name, {name: ..., kwargs}, or {from: ./my.py:MyClass}.
+    # Component-specific hyperparameters go in the spec dict, not in this dataclass --
+    # `oprl components` lists what each one accepts.
     surrogate: Any = "ppo"       # policy loss: ppo|tr_ppo|spo|dpo|mdpo|ppo_rpe|apo
-    advantage: Any = "gae"       # advantage estimator: gae|vtrace_free_mc
+    advantage: Any = "gae"       # advantage estimator: gae|dae|vtrace_free_mc
     value_loss: Any = "clipped"  # value loss: clipped|mse|huber
     network: Any = None          # network: {hidden:[...], encoder:..., from:...}
     # Epochs for an estimator's iteration_loss (DAE). 0 = reuse num_epochs.
     num_epochs_critic: int = 0
     buffer: Any = None           # extra buffer fields: {extra: {name: {shape, dtype}}}
 
-    # --- Per-surrogate hyperparameters, listed explicitly rather than hidden in kwargs ---
-    rollback_alpha: float = 0.3      # TR-PPO
-    spo_beta: float = 1.0            # SPO
-    dpo_alpha: float = 2.0           # DPO
-    dpo_beta: float = 0.6            # DPO
-    mdpo_tk: float = 1.0             # MDPO
-    rpe_alpha: float = 0.5           # PPO-RPE
-    apo_uarr_coef: float = 0.1       # APO
-    apo_resample: bool = True        # APO: resample unsampled actions for UARR
-
     # Written by train() each iteration, for surrogates that anneal (e.g. MDPO).
     _progress: float = 0.0
-    _resampled_logratio: object = None
-
-
-def buffer_extra(cfg: PPOConfig, estimator, env) -> dict:
-    """Extra buffer fields = config declarations + estimator requirements (§4.3)."""
-    from ..schema import env_symbols, schema_from_config
-
-    spec = (cfg.buffer or {}).get("extra") if isinstance(cfg.buffer, dict) else None
-    declared = schema_from_config(spec, env_symbols(env.obs_space, env.action_space))
-    # Env-dependent field shapes take priority over the estimator's static declaration.
-    from_est = dict(getattr(estimator, "extra_fields", None) or {})
-    if hasattr(estimator, "resolve_fields"):
-        from_est.update(estimator.resolve_fields(env.obs_space, env.action_space) or {})
-    dup = set(declared) & set(from_est)
-    if dup:
-        raise ValueError(f"buffer.extra collides with estimator fields: {sorted(dup)}")
-    return {**declared, **from_est} or None
 
 
 def ppo_loss(
@@ -138,6 +118,7 @@ def ppo_loss(
     }
 
 
+@algo("ppo", PPOConfig, note="PPO (Schulman et al., 2017), pluggable surrogate/advantage")
 def train(
     cfg: PPOConfig,
     env: EnvAdapter,
@@ -145,42 +126,28 @@ def train(
     log: Logger | None = None,
     estimator=None,
 ) -> Policy:
-    device = cfg.resolve_device()
-    # Seed everything before any parameter is created: cfg.seed must determine the whole
-    # run, not just the environment (see oprl/seeding.py).
-    seed_everything(cfg.seed, cfg.deterministic)
-    log = log or Logger(run_dir=cfg.run_dir)
-    timer = Timer()
-    estimator = get_estimator(estimator or cfg.advantage, cfg)
+    # Mechanical setup only -- see algos/_common.py for why it is shared. The training
+    # loop itself stays here, in full view.
+    rt = _common.setup(cfg, env, policy, log, estimator)
+    log, timer, buf, estimator = rt.log, rt.timer, rt.buf, rt.estimator
     surrogate = get_surrogate(cfg.surrogate)
     value_loss = get_value_loss(cfg.value_loss)
+    # Optional surrogate hooks, found by attribute check so nothing else implements them.
+    # APO needs both: an anchor sampled while theta is still theta_old, then a per-minibatch
+    # re-evaluation of it. See objectives/ppo_family.py:APOSurrogate.
+    prepare = getattr(surrogate, "prepare", None)
+    on_rollout_end = getattr(surrogate, "on_rollout_end", None)
 
-    obs_norm = (
-        ObsNormalizer(env.obs_space.shape, device) if cfg.norm_obs else None
-    )
-    reward_norm = (
-        RewardNormalizer(env.num_envs, cfg.gamma, device) if cfg.norm_reward else None
-    )
-
-    buf = RolloutBuffer(
-        cfg.rollout_len, env.num_envs, env.obs_space, env.action_space, device,
-        extra=buffer_extra(cfg, estimator, env),
-    )
     opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr, eps=1e-5)
-
-    batch = cfg.rollout_len * env.num_envs
-    n_iters = max(1, cfg.total_steps // batch)
     obs = env.reset(seed=cfg.seed)
     global_step = 0
+    stats: dict = {}
 
-    for it in range(n_iters):
-        cfg._progress = it / n_iters   # needed by surrogates that anneal on progress
-        if cfg.anneal_lr:
-            frac = 1.0 - cfg._progress
-            for g in opt.param_groups:
-                g["lr"] = frac * cfg.lr
+    for it in range(rt.n_iters):
+        _common.begin_iteration(cfg, opt, it, rt.n_iters)
 
-        obs, steps = collect(env, policy, buf, obs, log, timer, obs_norm, reward_norm,
+        obs, steps = collect(env, policy, buf, obs, log, timer, rt.obs_norm,
+                             rt.reward_norm,
                              extra_writer=getattr(estimator, "write_extra", None))
         global_step += steps
 
@@ -191,6 +158,12 @@ def train(
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         buf.advantages, buf.returns = adv, ret
         log.add(**diag)
+
+        # Anchor for objectives that reference pi_old beyond the stored logprobs (APO).
+        # Placed here, before any parameter update, so `policy` is still the behaviour
+        # policy that produced this rollout.
+        if on_rollout_end is not None:
+            on_rollout_end(policy, buf, cfg)
 
         # Estimators whose objective needs contiguous time (DAE's telescoping residual)
         # get one optimization pass over the whole rollout, before the minibatch loop
@@ -214,8 +187,8 @@ def train(
                 epoch, buf, policy=policy, surrogate=surrogate, cfg=cfg
             )
             for mb in buf.iter_minibatches(cfg.num_minibatches):
-                if cfg.surrogate == "apo" and cfg.apo_resample:
-                    cfg._resampled_logratio = _resample_logratio(policy, mb)
+                if prepare is not None:
+                    prepare(policy, mb, cfg)
                 with timer("bwd"):
                     loss, stats = ppo_loss(
                         policy, mb, cfg, surrogate, estimator, value_loss
@@ -233,41 +206,22 @@ def train(
             if stop:
                 break
 
-        log.record("diag/explained_variance",
-                   explained_variance(stats["_value"], stats["_returns"]))
-        log.record("train/lr", opt.param_groups[0]["lr"])
-        log.record("perf/sps", steps / max(1e-9, sum(timer.acc.values()) or 1e-9))
-        log.add(**timer.drain())
+        _common.log_iteration(rt, opt, stats, steps)
         if it % cfg.log_interval == 0:
             log.dump(global_step)
 
-    log.dump(global_step)
-    log.close()
+    _common.finish(log, global_step)
     return policy
 
 
-def _resample_logratio(policy: Policy, mb) -> torch.Tensor | None:
-    """Sample a batch of "unsampled actions" for APO's UARR and return their logratio.
+# A2C is a set of PPO hyperparameters, not a code file (DESIGN.md §4.6). Registering it
+# as an alias is what makes `oprl train a2c` work without a second train() function.
+A2C_DEFAULTS = dict(num_epochs=1, num_minibatches=1, clip_coef=math.inf, gae_lambda=1.0)
 
-    Actions are resampled from the current policy and then re-evaluated under it. These
-    actions **never appeared in the rollout**, which is exactly the anchoring blind spot
-    APO constrains. Returns None when the policy has no `dist()`, and the surrogate then
-    degrades explicitly.
-    """
-    if not hasattr(policy, "dist"):
-        return None
-    with torch.no_grad():
-        d = policy.dist(mb.obs)
-        a_new = d.sample()
-        lp_old = d.log_prob(a_new)
-        if lp_old.dim() > 1:
-            lp_old = lp_old.sum(-1)
-    lp_new, _, _ = policy.evaluate(mb.obs, a_new)
-    return lp_new - lp_old
+alias("a2c", of="ppo", defaults=A2C_DEFAULTS,
+      note="A2C = PPO with one epoch, one minibatch, no clipping, lambda=1")
 
 
 def a2c_config(**kw) -> PPOConfig:
     """A2C is a special case of PPO, not a separate code file."""
-    defaults = dict(num_epochs=1, num_minibatches=1, clip_coef=math.inf, gae_lambda=1.0)
-    defaults.update(kw)
-    return PPOConfig(**defaults)
+    return PPOConfig(**{**A2C_DEFAULTS, **kw})

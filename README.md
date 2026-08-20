@@ -101,17 +101,33 @@ Run `uv run oprl components` for the list of built-ins you are replacing.
 
 Two places to look for working code:
 
-- **[`diy/`](diy/)** -- bring-your-own algorithms. [`diy/spo/`](diy/spo/) reimplements
-  SPO (ICML 2025) in one standalone file that imports nothing from oprl, and
-  `tests/test_diy.py` asserts it is **numerically identical** to the built-in `spo`
-  surrogate. That makes the DIY path a verified equal, not an illustration.
+- **[`diy/`](diy/)** -- bring-your-own components, one directory per extension point.
+  [`diy/surrogates/spo.py`](diy/surrogates/spo.py) reimplements SPO (ICML 2025) in one
+  standalone file that imports nothing from oprl, and `tests/test_diy.py` asserts it is
+  **numerically identical** to the built-in `spo` surrogate.
+  [`diy/advantages/ga2e.py`](diy/advantages/ga2e.py) is the harder case: gradient-alignment
+  lambda selection, which needs the policy, backpropagation and cross-iteration state during
+  estimation -- and plugs in with **no framework edit**.
 - **[`examples/my_components.py`](examples/my_components.py)** -- one file touching all
   five extension points at once (encoder, advantage, policy loss, value loss, buffer field).
 
 ```bash
-python diy/spo/spo.py                               # component self-check, no env needed
-uv run oprl train ppo --config diy/spo/config.yaml  # train with it
+python diy/surrogates/spo.py                            # component self-check, no env needed
+python diy/advantages/ga2e.py                           # ditto, prints the alignment landscape
+uv run oprl train ppo --config diy/surrogates/spo.yaml  # train with it
 ```
+
+### Algorithms are pluggable too
+
+An algorithm is a registry entry like any other component, so adding one needs **no edit to
+the framework**:
+
+```bash
+uv run oprl algos                                 # what is registered
+uv run oprl train ./diy/algos/my_algo.py:train    # a train() function in your own file
+```
+
+See [`doc/fix.md`](doc/fix.md) for why this used to take five hardcoded edits.
 
 ## Experiment orchestration
 
@@ -172,17 +188,21 @@ src/oprl/
 │   └─ gym_vec.py              GymVecAdapter / TensorEnvAdapter
 │
 ├─ algos/              L2  one update rule = one file
-│   ├─ ppo.py                  (a2c_config() lives here; A2C is a PPO config)
+│   ├─ base.py                 algo registry: Algo record + @algo / alias
+│   ├─ _common.py              setup / begin_iteration / log_iteration (plumbing only)
+│   ├─ ppo.py                  (a2c is registered as an alias: PPO with other defaults)
 │   └─ vmpo.py
-└─ cli.py              L3  oprl train / configs / sweep / components
+└─ cli.py              L3  oprl train / configs / sweep / algos / components
 
 config/                    hyperparameters, one file per algorithm
 ├─ ppo.yaml                default / classic / mujoco / atari / minatar / a2c
 ├─ vmpo.yaml               default / classic / mujoco
 └─ experiments.yaml        sweep definitions
 
-diy/                       bring-your-own algorithms; nothing here is imported by oprl
-└─ spo/                    SPO reimplemented standalone, cross-checked against built-in
+diy/                       bring-your-own components; nothing here is imported by oprl
+├─ surrogates/spo.py       SPO reimplemented standalone, cross-checked against built-in
+├─ advantages/ga2e.py      GA2E: gradient-alignment lambda selection
+└─ algos/                  (empty) a whole new update rule goes here
 ```
 
 Two architectural rules, checked automatically by `tests/test_architecture.py`:
@@ -206,9 +226,10 @@ algorithms, not algorithms themselves.** Putting them in `algos/` would break th
 | `oprl.Logger` | SB3-compatible (`record` / `record_mean` / `dump`) plus auto-aggregation |
 | `oprl.envs` | Fixed wrapper stack per family, auto-detected from the env id |
 | `oprl.experiment` | Sweeps: envs serial, seeds parallel, adaptive GPU placement |
-| `algos.ppo` | PPO (plus `a2c_config()`), pluggable surrogate / advantage / value loss |
+| `algos.ppo` | PPO (a2c is a registered alias), pluggable surrogate / advantage / value loss |
 | `algos.vmpo` | V-MPO (ICLR 2020): E-step plus learned Lagrangian multipliers |
-| `objectives.ppo_family` | **7 published objectives**, ~15 lines each |
+| `algos.base` | Algo registry -- a new algorithm needs no framework edit |
+| `objectives.ppo_family` | **8 published objectives**, ~15 lines each |
 | `advantages` | Registry plus GAE and **DAE** (Direct Advantage Estimation) |
 
 Discrete and continuous action spaces both verified (CartPole / Pendulum).

@@ -15,13 +15,13 @@ from oprl.algos import ppo
 from oprl.config import load_config
 from oprl.objectives import get_surrogate
 
-DIY_SPO = "./diy/spo/spo.py:SimplePolicyOptimization"
+DIY_SPO = "./diy/surrogates/spo.py:SimplePolicyOptimization"
 REPO = Path(__file__).resolve().parents[1]
 
 
 def test_diy_files_exist():
-    for rel in ("diy/README.md", "diy/spo/spo.py", "diy/spo/config.yaml",
-                "diy/spo/README.md"):
+    for rel in ("diy/README.md", "diy/surrogates/spo.py", "diy/surrogates/spo.yaml",
+                "diy/surrogates/spo.md"):
         assert (REPO / rel).is_file(), f"missing {rel}"
 
 
@@ -31,11 +31,11 @@ def test_diy_imports_nothing_from_oprl():
     `spo.py` deliberately imports only torch, so it can be copied into another project
     or read without any framework context.
     """
-    src = (REPO / "diy/spo/spo.py").read_text(encoding="utf-8")
+    src = (REPO / "diy/surrogates/spo.py").read_text(encoding="utf-8")
     for line in src.splitlines():
         stripped = line.strip()
         if stripped.startswith(("import ", "from ")) and "oprl" in stripped:
-            pytest.fail(f"diy/spo/spo.py should not import oprl: {stripped}")
+            pytest.fail(f"diy/surrogates/spo.py should not import oprl: {stripped}")
 
 
 def test_diy_loads_from_path():
@@ -50,10 +50,14 @@ def test_diy_matches_builtin_numerically():
 
     If they diverge, either the example is wrong or the built-in is -- and both are
     supposed to be the same published formula.
+
+    Note both sides now take `beta` the same way, through `__init__`. It used to be
+    `cfg.spo_beta` for the built-in and `__init__` for the DIY copy; unifying that is
+    what makes this an apples-to-apples comparison rather than a coincidence.
     """
-    cfg = ppo.PPOConfig(clip_coef=0.2, spo_beta=1.0)
+    cfg = ppo.PPOConfig(clip_coef=0.2)
     diy = get_surrogate({"from": DIY_SPO, "beta": 1.0})
-    builtin = get_surrogate("spo")
+    builtin = get_surrogate({"name": "spo", "beta": 1.0})
 
     g = torch.Generator().manual_seed(0)
     logp_old = torch.randn(512, generator=g) * 0.1
@@ -67,7 +71,7 @@ def test_diy_matches_builtin_numerically():
     assert torch.allclose(loss_diy, loss_ref, atol=1e-6), (
         f"DIY SPO diverges from built-in: {loss_diy.item()} vs {loss_ref.item()}"
     )
-    assert abs(stats_diy["diag/kl_penalty"] - stats_ref["diag/kl_penalty"]) < 1e-6
+    assert abs(stats_diy["diag/spo_penalty"] - stats_ref["diag/spo_penalty"]) < 1e-6
 
 
 def test_diy_gradient_direction():
@@ -82,14 +86,35 @@ def test_diy_gradient_direction():
     assert logp.grad.sum() < 0
 
 
-def test_kl_penalty_vanishes_at_ratio_one():
-    """KL must be exactly 0 when pi_new == pi_old, otherwise the penalty biases every
-    update even when the policy has not moved."""
+def test_penalty_vanishes_at_ratio_one():
+    """The penalty must be exactly 0 when pi_new == pi_old, otherwise it biases every
+    update even when the policy has not moved.
+
+    Note a non-zero advantage is passed deliberately: the penalty carries a per-sample |A|
+    factor, so testing with adv=0 would pass even if `(r-1)^2` were computed wrongly.
+    """
     cfg = ppo.PPOConfig()
     _, stats = get_surrogate({"from": DIY_SPO})(
-        torch.ones(16), torch.zeros(16), torch.zeros(16), torch.zeros(16), cfg
+        torch.ones(16), torch.zeros(16), torch.zeros(16), torch.ones(16), cfg
     )
-    assert abs(stats["diag/kl_penalty"]) < 1e-9
+    assert abs(stats["diag/spo_penalty"]) < 1e-9
+
+
+def test_spo_loss_is_a_scalar():
+    """The whole objective sits inside one mean. Multiplying a per-sample |A| onto an
+    already-reduced mean returns a [B] vector, which autograd accepts before failing
+    somewhere far less obvious."""
+    cfg = ppo.PPOConfig()
+    for spec in (DIY_SPO,):
+        loss, _ = get_surrogate({"from": spec})(
+            torch.full((32,), 1.2), torch.zeros(32), torch.zeros(32),
+            torch.randn(32), cfg
+        )
+        assert loss.dim() == 0, f"loss has shape {tuple(loss.shape)}, expected a scalar"
+    loss, _ = get_surrogate("spo")(
+        torch.full((32,), 1.2), torch.zeros(32), torch.zeros(32), torch.randn(32), cfg
+    )
+    assert loss.dim() == 0, f"built-in spo loss has shape {tuple(loss.shape)}"
 
 
 def test_adaptive_beta_responds_to_kl():
@@ -106,9 +131,9 @@ def test_adaptive_beta_responds_to_kl():
 
 
 def test_diy_config_file_loads():
-    """`diy/spo/config.yaml` must parse into a PPOConfig, so a stale key here fails CI
+    """`diy/surrogates/spo.yaml` must parse into a PPOConfig, so a stale key here fails CI
     rather than at launch time."""
-    cfg = load_config(ppo.PPOConfig, str(REPO / "diy/spo/config.yaml"))
+    cfg = load_config(ppo.PPOConfig, str(REPO / "diy/surrogates/spo.yaml"))
     assert isinstance(cfg.surrogate, dict) and "from" in cfg.surrogate
     assert cfg.total_steps > 0
 

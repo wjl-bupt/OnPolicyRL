@@ -35,6 +35,7 @@ class EnvPreset:
     grayscale: bool = False
     resize: int | None = None      # square side length, e.g. 84
     frame_stack: int = 1
+    channels_first: bool = False   # transpose [H,W,C] -> [C,H,W] (MinAtar obs is channels-last)
     # --- Atari-specific ---
     noop_max: int = 0              # random no-op starts
     frame_skip: int = 1            # max-and-skip
@@ -76,6 +77,7 @@ MUJOCO = EnvPreset(
 
 MINATAR = EnvPreset(
     name="minatar",
+    channels_first=True,
     note="MinAtar 10x10 -- already compact; the Atari preprocessing stack is unneeded",
 )
 

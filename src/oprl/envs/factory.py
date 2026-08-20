@@ -13,6 +13,20 @@ from .gym_vec import GymVecAdapter
 from .presets import EnvPreset, get_preset
 
 
+def _register_minatar():
+    """Register the MinAtar gymnasium envs.
+
+    `minatar` declares a `gymnasium.envs` entry point but gymnasium 1.x does not load
+    third-party entry points automatically, so `gym.make("MinAtar/...")` raises
+    `NamespaceNotFound` until `minatar.gym.register_envs()` has been called. Do it here,
+    inside a function, so `import oprl` never pulls in the optional `minatar` dependency
+    (tests/test_architecture.py enforces that).
+    """
+    import minatar.gym
+
+    minatar.gym.register_envs()
+
+
 def _apply_wrappers(env, p: EnvPreset):
     """Single-env wrapper stack. **Order matters** -- see the comments per step."""
     import gymnasium as gym
@@ -51,6 +65,23 @@ def _apply_wrappers(env, p: EnvPreset):
     if p.clip_reward:
         env = w.TransformReward(env, lambda r: float(torch.sign(torch.tensor(r))))
 
+    # --- Transpose channels-last -> channels-first, innermost before any shape-dependent
+    #     wrapper: MinAtar returns [H,W,C] bool; the CNN expects [C,H,W]. ---
+    if p.channels_first:
+        class _ChannelsFirst(gym.ObservationWrapper):
+            def __init__(self, e):
+                super().__init__(e)
+                shape = e.observation_space.shape
+                self.observation_space = gym.spaces.Box(
+                    low=0, high=1, shape=(shape[2], shape[0], shape[1]),
+                    dtype=e.observation_space.dtype,
+                )
+
+            def observation(self, obs):
+                return obs.transpose(2, 0, 1)
+
+        env = _ChannelsFirst(env)
+
     # --- Frame stacking outermost: it defines the final observation shape. ---
     if p.frame_stack > 1:
         stack = getattr(w, "FrameStackObservation", None) or getattr(
@@ -83,6 +114,8 @@ def make_env(
     import gymnasium as gym
 
     p = get_preset(preset, env_id)
+    if p.name == "minatar":
+        _register_minatar()
     user_wrappers = extra_wrappers or []
 
     def _factory():

@@ -75,6 +75,8 @@ class CNNEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.float()
-        if self.scale:
+        if self.scale and x.max() > 1.0:
+            # Only 8-bit pixel encodings need /255. MinAtar is bool (0/1), and dividing
+            # it would collapse the signal to ~zero before the first layer.
             x = x / 255.0
         return self.head(self.conv(x))

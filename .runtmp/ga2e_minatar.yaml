@@ -1,0 +1,27 @@
+seed: 1
+device: cpu
+total_steps: 10000000
+num_envs: 16
+rollout_len: 128
+log_interval: 1
+smoke: false
+num_epochs: 4
+num_minibatches: 4
+lr: 0.00025
+anneal_lr: true
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.1
+clip_vloss: true
+ent_coef: 0.01
+vf_coef: 0.5
+max_grad_norm: 0.5
+norm_adv: minibatch
+target_kl: null
+norm_obs: false
+norm_reward: false
+surrogate: ppo
+advantage: {from: ./diy/advantages/ga2e.py:GA2E}
+value_loss: clipped
+network: null
+buffer: null

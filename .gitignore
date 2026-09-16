@@ -21,3 +21,4 @@ venv/
 .idea/
 .vscode/
 .DS_Store
+core

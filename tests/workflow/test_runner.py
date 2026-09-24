@@ -34,7 +34,7 @@ baseline:
   monitor:
     eval_interval: 100
     eval_episodes: 1
-    ckpt_interval: 100
+    ckpt_count: 1
 space:
   algo_params.epsilon: [0.2]
 """

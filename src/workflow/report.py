@@ -3,8 +3,9 @@
 
     results.json  -- machine-readable: per (experiment, env) stats + a flat ranking
     summary.md    -- human ranking table, one section per env
-    curve_<env>.png -- one figure per env, a line per experiment (cross-seed
-                       mean +/- std band)
+    curve_<env>_rollout.pdf / curve_<env>_eval.pdf -- two academic (CCF-A style)
+                     vector figures per env, a line per experiment (cross-seed
+                     mean +/- std band): the training curve and the eval curve
 
 It reads ONLY on-disk artifacts (each job's ``metrics.jsonl``) and never touches
 L2 -- the experiment declaration drives which run dirs to read (via ``expand``),
@@ -129,11 +130,91 @@ def write_summary_md(exp: Experiment, groups: list[GroupResult], path: Path) -> 
     Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 
+# --------------------------------------------------------------------------- #
+#  academic (CCF-A conference RL) plot style
+# --------------------------------------------------------------------------- #
+
+# Colorblind-friendly qualitative palette (seaborn "colorblind" hexes, written
+# out so no seaborn dependency is pulled in -- the 3-core-package budget holds).
+_PALETTE = ["#0173B2", "#DE8F05", "#029E73", "#D55E00", "#CC78BC",
+            "#CA9161", "#FBAFE4", "#949494", "#ECE133", "#56B4E9"]
+
+# rcParams for the conference look: embedded TrueType fonts (Type3 is rejected by
+# many camera-ready checks), serif family, thin axes, no clutter.
+_RC = {
+    "pdf.fonttype": 42, "ps.fonttype": 42,
+    "font.family": "serif", "font.size": 11,
+    "axes.titlesize": 13, "axes.labelsize": 13,
+    "xtick.labelsize": 11, "ytick.labelsize": 11,
+    "legend.fontsize": 10, "axes.linewidth": 0.8,
+    "lines.linewidth": 2.0, "figure.figsize": (6, 4),
+}
+
+
+def _plot_metric(plt, groups: list[GroupResult], run_dir: Path, *, series,
+                 ylabel: str, suffix: str, colors: dict, log=None) -> list[Path]:
+    """One PDF per env for a single metric family. `series(SeedResult)` returns
+    that seed's (step, value) points (rollout curve or eval curve). Each
+    experiment is one mean line + a +/- pop-std band, colored per `colors`. A
+    sparse curve (<=8 points, e.g. eval logged only a few times) gets markers so
+    the points are visible."""
+    envs: list[str] = []
+    for g in groups:                                 # preserve order, unique
+        if g.env not in envs:
+            envs.append(g.env)
+
+    written: list[Path] = []
+    for env in envs:
+        fig, ax = plt.subplots()
+        drew = False
+        for g in (x for x in groups if x.env == env):
+            by_step: dict[int, list[float]] = defaultdict(list)
+            for s in g.seeds:
+                for step, y in series(s):
+                    by_step[step].append(y)
+            if not by_step:
+                continue
+            steps = sorted(by_step)
+            mean = [statistics.fmean(by_step[s]) for s in steps]
+            std = [statistics.pstdev(by_step[s]) if len(by_step[s]) > 1 else 0.0
+                   for s in steps]
+            color = colors.get(g.label)
+            marker = "o" if len(steps) <= 8 else None    # sparse eval -> mark points
+            ax.plot(steps, mean, label=g.label, color=color,
+                    marker=marker, markersize=4)
+            ax.fill_between(steps, [m - d for m, d in zip(mean, std)],
+                            [m + d for m, d in zip(mean, std)],
+                            alpha=0.2, color=color, linewidth=0)
+            drew = True
+        if not drew:
+            plt.close(fig)
+            continue
+        ax.set_xlabel("Environment Steps")
+        ax.set_ylabel(ylabel)
+        ax.set_title(env)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(True, linestyle="--", alpha=0.3)
+        ax.legend(frameon=False)
+        fig.tight_layout()
+        out = Path(run_dir) / f"curve_{_env_slug(env)}_{suffix}.pdf"
+        fig.savefig(out, bbox_inches="tight")
+        plt.close(fig)
+        written.append(out)
+        if log is not None:
+            log.info("curve written", path=str(out))
+    return written
+
+
 def plot_curves(groups: list[GroupResult], run_dir: Path,
                 log: Logger | None = None) -> list[Path]:
-    """One reward-curve figure per env (a line per experiment, cross-seed mean
-    with a +/- std band). OPTIONAL: if matplotlib is not installed the figures
-    are skipped with a warning -- never an error."""
+    """Two vector PDFs per env -- ``curve_<env>_rollout.pdf`` (training curve)
+    and ``curve_<env>_eval.pdf`` (evaluation curve) -- in a CCF-A conference RL
+    style: a line per experiment (cross-seed mean) with a +/- std band. The two
+    figures use the SAME color per experiment so they can be read side by side.
+
+    OPTIONAL capability: matplotlib is imported lazily and a missing install
+    downgrades to "skip the figures, warn", never an error."""
     try:
         import matplotlib
         matplotlib.use("Agg")                       # headless, no display needed
@@ -143,45 +224,21 @@ def plot_curves(groups: list[GroupResult], run_dir: Path,
             log.warning(f"plot skipped (matplotlib unavailable): {e}")
         return []
 
-    envs: list[str] = []
-    for g in groups:                                 # preserve order, unique
-        if g.env not in envs:
-            envs.append(g.env)
+    # one stable color per experiment label, shared across both figures
+    labels: list[str] = []
+    for g in groups:
+        if g.label not in labels:
+            labels.append(g.label)
+    colors = {lab: _PALETTE[i % len(_PALETTE)] for i, lab in enumerate(labels)}
 
     written: list[Path] = []
-    for env in envs:
-        fig, ax = plt.subplots(figsize=(7, 4.5))
-        drew = False
-        for g in (x for x in groups if x.env == env):
-            by_step: dict[int, list[float]] = defaultdict(list)
-            for s in g.seeds:
-                for step, y in s.curve:
-                    by_step[step].append(y)
-            if not by_step:
-                continue
-            steps = sorted(by_step)
-            mean = [statistics.fmean(by_step[s]) for s in steps]
-            std = [statistics.pstdev(by_step[s]) if len(by_step[s]) > 1 else 0.0
-                   for s in steps]
-            line, = ax.plot(steps, mean, label=g.label)
-            ax.fill_between(steps, [m - d for m, d in zip(mean, std)],
-                            [m + d for m, d in zip(mean, std)],
-                            alpha=0.2, color=line.get_color())
-            drew = True
-        if not drew:
-            plt.close(fig)
-            continue
-        ax.set_xlabel("global_step")
-        ax.set_ylabel("rollout/ep_rew_mean")
-        ax.set_title(env)
-        ax.legend(fontsize=8)
-        fig.tight_layout()
-        out = Path(run_dir) / f"curve_{_env_slug(env)}.png"
-        fig.savefig(out, dpi=120)
-        plt.close(fig)
-        written.append(out)
-        if log is not None:
-            log.info("curve written", path=str(out))
+    with matplotlib.rc_context(_RC):
+        written += _plot_metric(plt, groups, run_dir, series=lambda s: s.curve,
+                                ylabel="Episode Return", suffix="rollout",
+                                colors=colors, log=log)
+        written += _plot_metric(plt, groups, run_dir, series=lambda s: s.eval_curve,
+                                ylabel="Evaluation Return", suffix="eval",
+                                colors=colors, log=log)
     return written
 
 

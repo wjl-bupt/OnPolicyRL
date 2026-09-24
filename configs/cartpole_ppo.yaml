@@ -32,10 +32,10 @@ baseline:
   network_params:             # -> PolicyConfig(**network_params) (plain fields only)
     net_arch: [64, 64]        # a fixed list value (lives in baseline, not space)
     lr: 0.0003
-  monitor:                    # -> Monitor(...) intervals, counted in updates
+  monitor:                    # -> Monitor(...); eval counted in updates
     eval_interval: 10
     eval_episodes: 10
-    ckpt_interval: 10
+    ckpt_count: 3             # save 3 models total: first rollout / middle / final
 
 space:                        # swept params: each value is a LIST of candidates
   algo_params.epsilon: [0.1, 0.2]

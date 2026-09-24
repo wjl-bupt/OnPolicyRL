@@ -50,22 +50,61 @@ def read_metrics(path: str | Path) -> list[dict]:
     return records
 
 
+# Mirror of logger._CATEGORY, kept LOCAL so results.py stays stdlib-only (L1).
+# The Logger groups each record into train/rollout/eval buckets; older runs are
+# still flat. `_lookup` reads a flat, prefixed key from either layout.
+_BUCKET = {
+    "train/": "train", "loss/": "train", "grad/": "train",
+    "diag/": "train", "time/": "train", "perf/": "train",
+    "rollout/": "rollout", "charts/": "rollout",
+    "eval/": "eval",
+}
+
+
+def _lookup(rec: dict, key: str):
+    """Value for a flat prefixed metric key, tolerant of both record layouts.
+
+    New grouped record: ``{"rollout": {"ep_rew_mean": ...}}``; legacy flat
+    record: ``{"rollout/ep_rew_mean": ...}``. Returns None if absent. The
+    grouping mirrors ``logger._CATEGORY``; a collision fallback that stored a
+    one-level-prefixed leaf (``loss.policy``) is also honored."""
+    if key in rec:                                  # legacy flat layout (fast path)
+        return rec[key]
+    for prefix, bucket in _BUCKET.items():
+        if key.startswith(prefix):
+            sub = rec.get(bucket)
+            if isinstance(sub, dict):
+                leaf = key[len(prefix):]
+                if leaf in sub:
+                    return sub[leaf]
+                alt = key.replace("/", ".", 1)      # collision fallback name
+                if alt in sub:
+                    return sub[alt]
+            return None
+    return None
+
+
 def _series(records: list[dict], key: str) -> list[tuple[int, float]]:
     """(step, value) points for `key`, deduped by step (last wins), step-ordered.
 
     The Logger re-emits the sliding-window metric on every dump, so the same
     step can appear more than once (e.g. the final flush repeats it); dedup by
-    step keeps one point per step. Non-finite values are dropped."""
+    step keeps one point per step. Non-finite values are dropped. Reads either
+    the grouped or the legacy-flat record layout via `_lookup`."""
     by_step: dict[int, float] = {}
     for r in records:
-        if key in r and "step" in r:
-            try:
-                v = float(r[key])
-                s = int(r["step"])
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(v):
-                by_step[s] = v
+        if "step" not in r:
+            continue
+        raw = _lookup(r, key)
+        if raw is None:
+            continue
+        try:
+            v = float(raw)
+            s = int(r["step"])
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(v):
+            by_step[s] = v
     return [(s, by_step[s]) for s in sorted(by_step)]
 
 
@@ -82,28 +121,32 @@ def _last_finite(records: list[dict], key: str) -> float:
 
     Used for `final_eval`: eval is only logged on eval iterations, and the very
     last dump line (the final flush) may carry only rollout metrics -- so we scan
-    for the last line that actually HAS an eval value, not the last line."""
+    for the last line that actually HAS an eval value, not the last line. Reads
+    either the grouped or the legacy-flat record layout via `_lookup`."""
     val = float("nan")
     for r in records:
-        if key in r:
-            try:
-                f = float(r[key])
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(f):
-                val = f
+        raw = _lookup(r, key)
+        if raw is None:
+            continue
+        try:
+            f = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(f):
+            val = f
     return val
 
 
 @dataclass
 class SeedResult:
-    """One seed's run reduced to scalars (+ its raw curve for plotting)."""
+    """One seed's run reduced to scalars (+ its raw curves for plotting)."""
 
     seed: int
     rew_last10: float
     rew_last30: float
     final_eval: float
-    curve: list[tuple[int, float]]     # (step, rollout/ep_rew_mean), for the plot
+    curve: list[tuple[int, float]]      # (step, rollout/ep_rew_mean), training plot
+    eval_curve: list[tuple[int, float]]  # (step, eval/ep_rew_mean), evaluation plot
     n_points: int
 
 
@@ -111,6 +154,7 @@ def seed_result(seed: int, metrics_path: str | Path) -> SeedResult:
     """Reduce one seed's metrics.jsonl to a `SeedResult`."""
     recs = read_metrics(metrics_path)
     curve = _series(recs, "rollout/ep_rew_mean")
+    eval_curve = _series(recs, "eval/ep_rew_mean")
     ys = [v for _, v in curve]
     return SeedResult(
         seed=int(seed),
@@ -118,6 +162,7 @@ def seed_result(seed: int, metrics_path: str | Path) -> SeedResult:
         rew_last30=_tail_mean(ys, 0.30),
         final_eval=_last_finite(recs, "eval/ep_rew_mean"),
         curve=curve,
+        eval_curve=eval_curve,
         n_points=len(curve),
     )
 

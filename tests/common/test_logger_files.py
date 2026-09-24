@@ -40,3 +40,25 @@ def test_no_run_dir_means_no_files(tmp_path):
     log.crash("nowhere to write")
     log.close()
     assert not list(tmp_path.iterdir())
+
+
+def test_metrics_jsonl_grouped_into_train_rollout_eval(tmp_path):
+    """metrics.jsonl groups each dump into train/rollout/eval buckets; other
+    prefixes (loss/…) merge into train. (The run.log table stays flat -- a
+    write-time view only, asserted by the ep_rew_mean check above.)"""
+    import json
+
+    log = Logger(run_dir=tmp_path)
+    log.record("loss/policy", 0.5)              # non-train prefix -> train bucket
+    log.record("train/kl", 0.01)                # -> train
+    log.record("rollout/ep_rew_mean", 42.0)     # -> rollout
+    log.record("eval/ep_rew_mean", 99.0)        # -> eval
+    log.dump(10)
+    log.close()
+
+    rec = json.loads((tmp_path / "metrics.jsonl")
+                     .read_text(encoding="utf-8").splitlines()[0])
+    assert rec["step"] == 10
+    assert rec["train"]["policy"] == 0.5 and rec["train"]["kl"] == 0.01
+    assert rec["rollout"]["ep_rew_mean"] == 42.0
+    assert rec["eval"]["ep_rew_mean"] == 99.0

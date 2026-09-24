@@ -9,9 +9,12 @@ Three responsibilities live here, not in the loop:
   analysis-stage decision, not the loop's.
 * **evaluation** -- periodic AND final, on a FRESH independent env
   (common/evaluate), so eval never disturbs the training env's RNG/autoreset.
-* **checkpointing** -- periodic AND final (common/checkpoint), into the run's
-  model pool ``run_dir/model_pools/model_step-<global_step>.pt`` (one file per
-  save, named by step -- never overwritten; resume picks the newest).
+* **checkpointing** -- ``ckpt_count`` saves total by default (first rollout /
+  evenly-spaced middles / final), into the run's model pool
+  ``run_dir/model_pools/model_step-<global_step>.pt`` (one file per save, named
+  by step -- never overwritten; resume picks the newest). This keeps the model
+  pool tiny instead of one file every ``ckpt_interval`` updates; set
+  ``ckpt_count<=0`` to fall back to the legacy periodic ``ckpt_interval``.
 
 The final iteration is self-detected (`global_step >= total_steps`), so the loop
 needs no extra line: the single existing `monitor.observe(...)` call in
@@ -37,7 +40,7 @@ class Monitor:
     def __init__(self, policy, env_factory: Callable[[], object], *, log,
                  run_dir: str | Path, total_steps: int,
                  eval_interval: int = 10, eval_episodes: int = 10,
-                 ckpt_interval: int = 20, eval_seed: int = 0,
+                 ckpt_count: int = 3, ckpt_interval: int = 20, eval_seed: int = 0,
                  kl_threshold: float = 0.5, meta: dict | None = None,
                  eval_fn: Callable = evaluate, save_fn: Callable = save_checkpoint):
         self.policy = policy
@@ -48,12 +51,24 @@ class Monitor:
         self.total_steps = int(total_steps)
         self.eval_interval = int(eval_interval)
         self.eval_episodes = int(eval_episodes)
+        self.ckpt_count = int(ckpt_count)
         self.ckpt_interval = int(ckpt_interval)
         self.eval_seed = int(eval_seed)
         self.kl_threshold = float(kl_threshold)
         self.meta = dict(meta or {})
         self._eval_fn = eval_fn
         self._save_fn = save_fn
+
+        # count-mode checkpoint schedule (default): N = ckpt_count saves total =
+        # first (iteration 1, right after the first rollout) + (N-2) evenly-spaced
+        # middles + final. The middle target steps are fixed up front from
+        # total_steps; observe() fires one when global_step first crosses it.
+        n_mid = max(0, self.ckpt_count - 2)
+        self._ckpt_mid_targets = (
+            [self.total_steps * k / (self.ckpt_count - 1)
+             for k in range(1, n_mid + 1)] if self.ckpt_count >= 2 else [])
+        self._ckpt_next = 0                 # index of the next middle target to fire
+        self._ckpt_saved: set[int] = set()  # global_steps already written (dedup)
 
     # -------------------------------- the hook --------------------------- #
 
@@ -65,7 +80,7 @@ class Monitor:
         final = global_step >= self.total_steps
         if self._due(iteration, self.eval_interval, final):
             self._safe_eval(global_step, iteration)
-        if self._due(iteration, self.ckpt_interval, final):
+        if self._ckpt_due(global_step, iteration, final):
             self._safe_ckpt(global_step, iteration)
 
     @staticmethod
@@ -73,6 +88,29 @@ class Monitor:
         if final:                       # the last iteration always evals + ckpts
             return True
         return interval > 0 and iteration % interval == 0
+
+    def _ckpt_due(self, gs: int, iteration: int, final: bool) -> bool:
+        """Count-mode checkpoint schedule (default): fire at the first iteration,
+        at each evenly-spaced middle target as ``global_step`` crosses it, and at
+        the final iteration -- ``ckpt_count`` files total. ``ckpt_count == 1``
+        keeps only the final model; ``ckpt_count <= 0`` falls back to the legacy
+        periodic ``ckpt_interval``. If one update spans several middle targets
+        (coarse rollout / large N) they collapse into a single save -- fewer
+        files, never more."""
+        if self.ckpt_count <= 0:            # count disabled -> legacy periodic mode
+            return self._due(iteration, self.ckpt_interval, final)
+        if final:                           # the last iteration always checkpoints
+            return True
+        if self.ckpt_count == 1:            # only the final model is kept
+            return False
+        if iteration == 1:                  # first checkpoint, right after rollout 1
+            return True
+        fired = False
+        while (self._ckpt_next < len(self._ckpt_mid_targets)
+               and gs >= self._ckpt_mid_targets[self._ckpt_next]):
+            self._ckpt_next += 1
+            fired = True
+        return fired
 
     # ------------------------------ anomalies ---------------------------- #
 
@@ -107,6 +145,8 @@ class Monitor:
                            error=repr(e), level="error")
 
     def _safe_ckpt(self, gs: int, it: int) -> None:
+        if gs in self._ckpt_saved:            # never write the same step twice
+            return
         try:
             # model pool: one file per checkpoint, named by global_step (never
             # overwritten) -- resume picks the newest, earlier steps stay for
@@ -114,6 +154,7 @@ class Monitor:
             path = self.model_pool_dir / f"model_step-{gs}.pt"
             self._save_fn(path, self.policy,
                           global_step=gs, iteration=it, meta=self.meta)
+            self._ckpt_saved.add(gs)
         except Exception as e:  # noqa: BLE001 -- losing a ckpt beats losing the run
             self.log.event("checkpoint_failed", iteration=it, global_step=gs,
                            error=repr(e), level="error")

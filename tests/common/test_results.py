@@ -32,6 +32,26 @@ def test_seed_result_metric_definitions(tmp_path):
     assert sr.rew_last10 == 10.0                # ceil(10*0.1)=1 -> [10]
     assert sr.rew_last30 == 9.0                 # ceil(10*0.3)=3 -> mean(8,9,10)
     assert sr.final_eval == 100.0               # last line WITH eval, not the flush
+    assert sr.eval_curve == [(500, 50.0), (1000, 100.0)]   # eval logged @5,@10
+
+
+def test_seed_result_reads_grouped_layout(tmp_path):
+    """New nested metrics.jsonl (train/rollout/eval buckets) reads identically to
+    the legacy flat layout -- results.py must parse both (backward compatible)."""
+    rows = []
+    for i in range(1, 11):
+        rec = {"step": i * 100, "rollout": {"ep_rew_mean": float(i)}}
+        if i in (5, 10):
+            rec["eval"] = {"ep_rew_mean": float(i * 10)}    # 50 @500, 100 @1000
+        rows.append(rec)
+    p = tmp_path / "metrics.jsonl"
+    _write_jsonl(p, rows)
+
+    sr = seed_result(0, p)
+    assert sr.n_points == 10
+    assert sr.curve[-1] == (1000, 10.0)
+    assert sr.final_eval == 100.0
+    assert sr.eval_curve == [(500, 50.0), (1000, 100.0)]
 
 
 def test_missing_file_is_all_nan(tmp_path):

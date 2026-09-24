@@ -60,8 +60,9 @@ def test_report_three_piece_and_ranking(tmp_path):
     md = (run_dir / "summary.md").read_text(encoding="utf-8")
     assert "## EnvA" in md and "epsilon=0.2" in md
 
-    # matplotlib is installed here -> a per-env curve PNG is produced
-    assert (run_dir / "curve_EnvA.png").exists()
+    # matplotlib is installed here -> two academic vector PDFs per env
+    assert (run_dir / "curve_EnvA_rollout.pdf").exists()
+    assert (run_dir / "curve_EnvA_eval.pdf").exists()
 
 
 def test_plot_guard_when_matplotlib_missing(tmp_path, monkeypatch):

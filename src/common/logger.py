@@ -111,15 +111,33 @@ class ConsoleSink:
 
 
 class JsonlSink:
-    """The authoritative data source: one JSON object per dump, flushed at once."""
+    """The authoritative data source: one JSON object per dump, flushed at once.
 
-    def __init__(self, path: Path | str):
+    Records are grouped by category (train / rollout / eval) unless
+    ``group=False``: the flat, prefix-tagged metric keys the Logger accumulates
+    (``train/kl``, ``rollout/ep_rew_mean``, ...) are regrouped at write time into
+    nested buckets (``{"train": {"kl": ...}}``) -- see ``_group_metrics``. This is
+    a WRITE-TIME view only; the Logger's internal book-keeping and the console
+    table stay flat, so ``history()`` and the table layout are untouched."""
+
+    def __init__(self, path: Path | str, group: bool = True):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._f = open(self.path, "a", encoding="utf-8")
+        self.group = group
+        self._warned_collision = False
 
     def write(self, metrics: dict[str, float], step: int) -> None:
-        rec = {"step": step, "wall_time": time.time(), **metrics}
+        if self.group:
+            payload, collided = _group_metrics(metrics)
+            if collided and not self._warned_collision:
+                self._warned_collision = True
+                print("[oprl] warning: metric leaf-name collision inside a "
+                      "category bucket; kept the prefixed key to avoid "
+                      "overwrite", file=sys.stderr)
+        else:
+            payload = dict(metrics)
+        rec = {"step": step, "wall_time": time.time(), **payload}
         self._f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         self._f.flush()
 
@@ -143,6 +161,59 @@ def _agg_for(key: str) -> str:
         if key.startswith(prefix):
             return how
     return "mean"  # algorithm-specific keys (e.g. ga2e/*) need zero registration
+
+
+# --------------------------------------------------------------------------- #
+#  prefix -> category bucket (metrics.jsonl grouping; write-time view only)
+# --------------------------------------------------------------------------- #
+
+# Three buckets by author request: everything produced during optimization
+# (train/loss/grad/diag/time/perf) is "train"; the rollout sliding-window stats
+# (rollout/charts) are "rollout"; deterministic evaluation is "eval". This drives
+# ONLY how JsonlSink lays a record out on disk -- aggregation (_AGG), the console
+# table and history() all keep the flat, prefixed keys.
+_CATEGORY = {
+    "train/": "train", "loss/": "train", "grad/": "train",
+    "diag/": "train", "time/": "train", "perf/": "train",
+    "rollout/": "rollout", "charts/": "rollout",
+    "eval/": "eval",
+}
+_BUCKET_ORDER = ("train", "rollout", "eval")
+
+
+def _group_metrics(metrics: dict[str, float]) -> tuple[dict[str, Any], bool]:
+    """Regroup flat prefixed keys into category buckets, leaf-named.
+
+    ``train/kl`` -> ``{"train": {"kl": ...}}``. A key whose prefix is unknown
+    stays flat at the top level (nothing is hidden). If two keys collide on the
+    same leaf within one bucket, the later keeps a one-level-prefixed name
+    (``loss/policy`` -> ``loss.policy``) rather than overwriting -- returns a
+    ``collided`` flag so the caller can warn once. Buckets come out in a fixed
+    train/rollout/eval order for stable, diff-friendly records."""
+    buckets: dict[str, dict[str, float]] = {}
+    flat_extra: dict[str, float] = {}
+    collided = False
+    for key, val in metrics.items():
+        bucket, leaf = None, key
+        for prefix, name in _CATEGORY.items():
+            if key.startswith(prefix):
+                bucket, leaf = name, key[len(prefix):]
+                break
+        if bucket is None:
+            flat_extra[key] = val
+            continue
+        b = buckets.setdefault(bucket, {})
+        if leaf in b:
+            b[key.replace("/", ".", 1)] = val      # keep prefix, never overwrite
+            collided = True
+        else:
+            b[leaf] = val
+    out: dict[str, Any] = {name: buckets[name]
+                           for name in _BUCKET_ORDER if name in buckets}
+    for name, b in buckets.items():                # any future/extra bucket
+        out.setdefault(name, b)
+    out.update(flat_extra)                          # unknown-prefix keys stay flat
+    return out, collided
 
 
 # --------------------------------------------------------------------------- #
@@ -458,9 +529,14 @@ if __name__ == "__main__":
 
         lines = [json.loads(l) for l in
                  open(Path(td) / "metrics.jsonl", encoding="utf-8")]
-        assert lines[0]["step"] == 2048 and abs(lines[0]["diag/kl"] - 0.009) < 1e-9
-        assert "loss/policy" not in lines[1], "acc keys must clear after dump"
-        assert abs(lines[0]["time/env_frac"] + lines[0]["time/fwd_frac"] - 1.0) < 1e-9
+        # records are grouped into train/rollout/eval buckets, leaf-named
+        assert lines[0]["step"] == 2048
+        assert abs(lines[0]["train"]["kl"] - 0.009) < 1e-9         # was diag/kl
+        assert abs(lines[0]["eval"]["ep_rew_mean"] - 187.3) < 1e-9
+        assert abs(lines[0]["rollout"]["ep_rew_mean"] - 199.5) < 1e-9
+        assert "train" not in lines[1], "acc keys must clear after dump"
+        assert abs(lines[0]["train"]["env_frac"]
+                   + lines[0]["train"]["fwd_frac"] - 1.0) < 1e-9
         anom = [json.loads(l) for l in
                 open(Path(td) / "anomalies.jsonl", encoding="utf-8")]
         assert anom[0]["kind"] == "kl_explode" and anom[0]["value"] == 0.42

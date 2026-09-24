@@ -260,7 +260,8 @@ class RolloutBuffer:
         total_frames = sum(e - s for _, s, e in segs)
         target = self._spec.trajectory_frames or max(
             1, total_frames // self._spec.num_minibatches)
-        order = torch.randperm(len(segs), generator=generator).tolist()
+        order = torch.randperm(len(segs), generator=generator,
+                               device=self.device).tolist()
         batch: list[tuple[int, int, int]] = []
         frames = 0
         for i in order:

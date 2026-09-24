@@ -1,0 +1,42 @@
+# Quick CartPole PPO demo experiment -- the L4 vertical slice.
+#
+#   scripts/run.sh configs/cartpole_ppo.yaml
+#   (or: python src/workflow/runner.py configs/cartpole_ppo.yaml)
+#
+# `baseline` holds fixed values; `space` holds the parameters to sweep. Each
+# combination of `space` values is one "experiment"; every experiment runs
+# across ALL `envs` and `runs` seeds, in the order experiment -> env -> seed
+# (one experiment finishes entirely before the next starts).
+#
+# Dotted keys in `space` (e.g. algo_params.epsilon) address nested fields inside
+# `baseline` -- YAML does not auto-nest dots. A list in `baseline`
+# (net_arch: [64, 64]) is one fixed value; a list in `space` is the set of
+# candidates for that key. Same syntax, different section.
+
+algo: ppo
+envs: [CartPole-v1]           # the env axis: every experiment runs across all of these
+runs: 2                       # seeds are FIXED to 0..runs-1 (no hand-picked seeds)
+resume: false                  # true = resume/skip finished jobs; false = fresh start
+# run_dir is derived by the runner as runs/<name> (name = this file's stem ->
+# runs/cartpole_ppo). Uncomment to override for debugging.
+# run_dir: runs/cartpole_ppo
+
+baseline:
+  algo_params:                # -> PPOConfig(**algo_params); `seed` is injected per job
+    num_envs: 8
+    rollout_len: 128
+    ppo_epoch: 256
+    num_mini_batch: 4
+    total_steps: 20000        # small on purpose -- a quick demo, not a benchmark
+    use_value_clipped: false
+  network_params:             # -> PolicyConfig(**network_params) (plain fields only)
+    net_arch: [64, 64]        # a fixed list value (lives in baseline, not space)
+    lr: 0.0003
+  monitor:                    # -> Monitor(...) intervals, counted in updates
+    eval_interval: 10
+    eval_episodes: 10
+    ckpt_interval: 10
+
+space:                        # swept params: each value is a LIST of candidates
+  algo_params.epsilon: [0.1, 0.2]
+# grid: 2 (epsilon) x 1 (env) x 2 (runs) = 4 jobs

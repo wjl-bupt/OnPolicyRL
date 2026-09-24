@@ -41,7 +41,10 @@ class PPOConfig:
     # update
     ppo_epoch: int = 4
     num_mini_batch: int = 4
-    epsilon: float = 0.2            # policy clip range
+    epsilon: float = 0.2            # policy clip range (initial value if scheduled)
+    clip_schedule: str = "constant"  # "constant" | "linear" (anneal eps over training)
+    clip_range_min: float = 1e-3    # linear floor -- eps never reaches 0 (a 0 clip
+                                    # range removes the trust region -> vanilla PG)
     vf_epsilon: float | None = None  # value clip range (ABSOLUTE, in value units); None -> `epsilon`
     use_value_clipped: bool = False  # off by default (SB3 baseline PPO); True -> clipped ValueLoss
     ent_coef: float = 0.0
@@ -65,6 +68,8 @@ class PPOConfig:
             self.vf_epsilon = self.epsilon
         if self.num_mini_batch < 1 or self.ppo_epoch < 1:
             raise ValueError("ppo_epoch / num_mini_batch must be >= 1")
+        if self.clip_schedule not in ("constant", "linear"):
+            raise ValueError("clip_schedule must be 'constant' or 'linear'")
 
 
 # --------------------------------------------------------------------------- #
@@ -102,18 +107,34 @@ class ClipPolicyLoss:
 
     One class, one method: swapping the objective means swapping this object
     (algo_design §5.3); A2C would be a vanilla_pg class here, not a config trick.
+
+    The clip range may DECAY over training: `constant` holds epsilon; `linear`
+    anneals it from epsilon down to epsilon_min as `batch.progress` runs 0 -> 1,
+    floored at epsilon_min so it never hits 0 (a 0 clip range removes the trust
+    region and collapses PPO to vanilla policy-gradient).
     """
 
-    def __init__(self, epsilon: float = 0.2):
+    def __init__(self, epsilon: float = 0.2, schedule: str = "constant",
+                 epsilon_min: float = 1e-3):
         self.epsilon = epsilon
+        self.schedule = schedule
+        self.epsilon_min = epsilon_min
+
+    def _current_eps(self, progress: float) -> float:
+        """The clip range at this point in training (`progress` in [0, 1])."""
+        if self.schedule == "linear":
+            eps = self.epsilon_min + (self.epsilon - self.epsilon_min) * (1.0 - progress)
+            return max(self.epsilon_min, eps)
+        return self.epsilon
 
     def __call__(self, batch: Batch) -> tuple[Tensor, dict[str, float]]:
+        eps = self._current_eps(batch.progress)
         ratio = (batch.logp - batch.old_log_prob).exp()
         pg1 = -batch.advantages * ratio
-        pg2 = -batch.advantages * ratio.clamp(1 - self.epsilon, 1 + self.epsilon)
+        pg2 = -batch.advantages * ratio.clamp(1 - eps, 1 + eps)
         loss = th.max(pg1, pg2).mean()
         clipfrac = (pg2 > pg1).float().mean().item()
-        return loss, {"train/clipfrac": clipfrac}
+        return loss, {"train/clipfrac": clipfrac, "train/clip_range": eps}
 
 
 class ValueLoss:
@@ -157,7 +178,8 @@ class PPO:
         self.monitor = monitor                     # report-only, never stops (§5.2)
 
         self.adv_fn = get_adv_estimator_fn(config.adv_estimator)
-        self.policy_loss = ClipPolicyLoss(config.epsilon)
+        self.policy_loss = ClipPolicyLoss(config.epsilon, config.clip_schedule,
+                                          config.clip_range_min)
         self.value_loss = ValueLoss(config.vf_epsilon if config.use_value_clipped
                                     else None)
         self.timer = Timer()
@@ -219,8 +241,10 @@ class PPO:
         cfg = self.config
         stats: dict[str, float] = {}
         stop = False
-        # one generator per update: reproducible shuffles, different per epoch
-        generator = th.Generator()
+        # one generator per update: reproducible shuffles, different per epoch.
+        # It must live on the buffer's device -- torch.randperm requires the
+        # generator and the target device to match (CPU path: device=cpu).
+        generator = th.Generator(device=self.rollout_buffer.device)
         generator.manual_seed(cfg.seed + self.num_updates * 1000)
 
         for _ in range(cfg.ppo_epoch):
@@ -266,13 +290,16 @@ class PPO:
     def _make_batch_(self, data: RolloutSamples) -> Batch:
         """S8: ONE evaluate over the minibatch, then assemble the context. The
         policy owns the distribution (doc §9.2 S8): stored obs + actions -> the
-        current logp / entropy / value in a single forward."""
+        current logp / entropy / value in a single forward. `progress` (fraction
+        of total_steps consumed) is stamped here so scheduled components -- e.g. a
+        decaying clip range -- can read it off the batch."""
         logp, entropy, value = self.policy.evaluate(data.observations, data.actions)
+        progress = min(1.0, self.global_step / max(1, self.config.total_steps))
         return Batch(
             observations=data.observations, actions=data.actions,
             old_log_prob=data.old_log_prob, old_values=data.old_values,
             advantages=data.advantages, returns=data.returns,
-            logp=logp, entropy=entropy, value=value,
+            logp=logp, entropy=entropy, value=value, progress=progress,
         )
 
     # ------------------------------- S12 ---------------------------------- #
@@ -299,7 +326,12 @@ class PPO:
                 self.log.dump(self.global_step)
 
         self.log.dump(self.global_step)
-        self.log.close()
+        # NOTE: we do NOT close the logger here. The logger is owned by the
+        # caller (the workflow runner in the framework path, the test/script in
+        # standalone use) -- it may still want to log "job complete" after this
+        # returns. Closing a logger you did not create is an ownership bug (it
+        # was the cause of a write-after-close on run.log). Sinks flush per
+        # write, so nothing is lost by leaving the close to the owner.
 
     def _sps_and_drain(self) -> float:
         t = self.timer.drain()
@@ -311,5 +343,48 @@ class PPO:
     # ------------------------------ checkpoint ---------------------------- #
 
     def _save_(self) -> None:
-        """R2: policy + optimizer + buffer meta + rng (DESIGN_v2 §5.1)."""
+        """R2: policy + optimizer + buffer meta + rng (DESIGN_v2 §5.1).
+
+        Kept a no-op inside the class on purpose: checkpointing is orchestrated
+        by the workflow Monitor (common/checkpoint over policy + rng + step), so
+        the loop stays ignorant of run directories. The single `monitor.observe`
+        call in train() is the whole L2<->L4 contact surface."""
         pass
+
+
+# --------------------------------------------------------------------------- #
+#  module-level entry -- how the workflow layer (L4) runs PPO (algo_design §1)
+# --------------------------------------------------------------------------- #
+
+
+def train(cfg: PPOConfig, env, policy, log: Logger | None = None,
+          monitor=None, resume: dict | None = None) -> dict:
+    """The framework's entry into PPO: it hands over cfg + env + policy + log +
+    monitor, and PPO owns the collect->update loop inside -- it is the only
+    built-in training loop (a future V-MPO copies this file, it does not
+    decompose the loop into an UpdateRule yet).
+
+    The rollout buffer is the algorithm's PRIVATE concern, built here from the
+    env's spaces with the minibatch count the config asks for -- so the runner
+    never learns what a buffer is (a future GA2E would add `extra_samples` at
+    exactly this line and the runner would not change).
+
+    `resume`, when given, is the `{global_step, iteration}` a checkpoint the
+    runner already loaded into `policy`; the step counters are fast-forwarded so
+    the outer `while global_step < total_steps` continues rather than restarting.
+    Returns a small summary dict the runner records as the job result.
+    """
+    from memory.buffer import RolloutBuffer
+    from protocol.buffer import base_schema
+    from protocol.sample import MinibatchSpec
+
+    schema = base_schema(env.obs_space, env.action_space)
+    spec = MinibatchSpec(num_minibatches=cfg.num_mini_batch)
+    buf = RolloutBuffer(cfg.rollout_len, cfg.num_envs, schema,
+                        device=cfg.device, spec=spec)
+    ppo = PPO(env, policy, buf, cfg, log=log, monitor=monitor)
+    if resume:
+        ppo.global_step = int(resume.get("global_step", 0))
+        ppo.num_updates = int(resume.get("iteration", 0))
+    ppo.train()
+    return {"global_step": ppo.global_step, "iteration": ppo.num_updates}

@@ -186,25 +186,46 @@ class Logger:
         self._failed: set[int] = set()
         self._anomaly_failed = False
 
+        # human-readable text logs beside the two machine jsonl files:
+        #   run.log     -- the normal narrative: every message + every metric table
+        #   anomaly.log -- readable mirror of event() (machine copy: anomalies.jsonl)
+        #   error.log   -- crash tracebacks (lazy; written by crash())
+        self._run_log = None
+        self._anomaly_log = None
+        self._error_log = None
+        self._file_failed: set[str] = set()
+        if self.run_dir is not None:
+            try:
+                self._run_log = open(self.run_dir / "run.log", "a", encoding="utf-8")
+                # metric tables also land in run.log, plain (no ANSI escapes in a file)
+                self.sinks.append(ConsoleSink(stream=self._run_log,
+                                              use_color=False, style=table_style))
+            except Exception as e:  # noqa: BLE001
+                print(f"[oprl] warning: cannot open run.log: {e}", file=sys.stderr)
+                self._run_log = None
+
     # ----------------------------- messages ----------------------------- #
 
     def log(self, level: str, msg: str, **kv) -> None:
-        """One colored message line: `[oprl][LEVEL] msg | k=v k=v`."""
+        """One colored message line: `[oprl][LEVEL] msg | k=v k=v`. When a
+        run_dir is set, the plain (un-colored) line is also appended to run.log
+        so the human-readable narrative survives the process."""
         lv = _LEVELS.get(level, INFO)
         if lv < self.min_level:
             return
         stream = _STREAM.get(level, sys.stdout)
         on = supports_color(stream) if self.use_color is None else self.use_color
-        tag = _colorize(f"{_TAG.get(level, level.upper()):<7}", _LEVEL_COLOR.get(level, "cyan"),
-                        on, bold=lv >= WARNING)
-        suffix = ""
-        if kv:
-            kv_txt = " ".join(f"{k}={v}" for k, v in kv.items())
-            suffix = " | " + _colorize(kv_txt, "gray", on)
+        tag_txt = f"{_TAG.get(level, level.upper()):<7}"
+        kv_txt = " ".join(f"{k}={v}" for k, v in kv.items()) if kv else ""
+        tag = _colorize(tag_txt, _LEVEL_COLOR.get(level, "cyan"), on, bold=lv >= WARNING)
+        suffix = (" | " + _colorize(kv_txt, "gray", on)) if kv_txt else ""
         try:
             print(f"[oprl][{tag}] {msg}{suffix}", file=stream, flush=True)
         except Exception:  # a closed stream must never kill training
             pass
+        if self._run_log is not None:
+            line = f"[oprl][{tag_txt}] {msg}" + (f" | {kv_txt}" if kv_txt else "")
+            self._write_file("_run_log", "run.log", line + "\n")
 
     def debug(self, msg: str, **kv) -> None:
         self.log("debug", msg, **kv)
@@ -315,9 +336,58 @@ class Logger:
                     self._anomaly_failed = True
                     print(f"[oprl] warning: cannot write anomalies.jsonl, "
                           f"events are console-only: {e}", file=sys.stderr)
+        # readable mirror for humans (the machine copy is already in anomalies.jsonl)
+        fp = self._ensure_file("_anomaly_log", "anomaly.log")
+        if fp is not None:
+            extras = " ".join(f"{k}={v}" for k, v in payload.items())
+            line = (f"[{_TAG.get(level, level.upper())}] {kind} "
+                    f"iteration={iteration} global_step={global_step} {extras}").rstrip()
+            self._write_file("_anomaly_log", "anomaly.log", line + "\n")
         self.log(level, f"event:{kind}", **payload)
 
+    def crash(self, text: str) -> None:
+        """Append a crash traceback to error.log (the run's failure record).
+
+        Kept separate from error(): the caller still prints a one-line error to
+        the console, while the full multi-line traceback goes only to disk -- out
+        of the metric narrative but preserved for the post-mortem. Lazy, file-only.
+        """
+        if self._ensure_file("_error_log", "error.log") is not None:
+            self._write_file("_error_log", "error.log", text.rstrip() + "\n")
+
     # ------------------------------ internals ---------------------------- #
+
+    def _ensure_file(self, attr: str, filename: str):
+        """Lazily open an owned text log under run_dir; return the fp or None.
+        Never raises -- a missing text log must not kill a training run."""
+        fp = getattr(self, attr, None)
+        if fp is not None:
+            return fp
+        if self.run_dir is None or filename in self._file_failed:
+            return None
+        try:
+            fp = open(self.run_dir / filename, "a", encoding="utf-8")
+            setattr(self, attr, fp)
+            return fp
+        except Exception as e:  # noqa: BLE001
+            self._file_failed.add(filename)
+            print(f"[oprl] warning: cannot open {filename}: {e}", file=sys.stderr)
+            return None
+
+    def _write_file(self, attr: str, filename: str, text: str) -> None:
+        """Append to an owned text log; disable-after-warning, never raise."""
+        if filename in self._file_failed:
+            return
+        fp = getattr(self, attr, None)
+        if fp is None:
+            return
+        try:
+            fp.write(text)
+            fp.flush()
+        except Exception as e:  # noqa: BLE001
+            self._file_failed.add(filename)
+            print(f"[oprl] warning: {filename} write failed, disabling it: {e}",
+                  file=sys.stderr)
 
     def _emit(self, metrics: dict[str, float], step: int) -> None:
         for i, s in enumerate(self.sinks):
@@ -343,6 +413,13 @@ class Logger:
                 self._anomalies.close()
             except Exception:
                 pass
+        for attr in ("_run_log", "_anomaly_log", "_error_log"):
+            fp = getattr(self, attr, None)
+            if fp is not None:
+                try:
+                    fp.close()
+                except Exception:
+                    pass
 
 
 # --------------------------------------------------------------------------- #
@@ -387,4 +464,10 @@ if __name__ == "__main__":
         anom = [json.loads(l) for l in
                 open(Path(td) / "anomalies.jsonl", encoding="utf-8")]
         assert anom[0]["kind"] == "kl_explode" and anom[0]["value"] == 0.42
+        run_log = (Path(td) / "run.log").read_text(encoding="utf-8")
+        assert "this is info" in run_log, "messages must be persisted to run.log"
+        # sb3 tables group by prefix: the leaf row label appears, not "loss/policy"
+        assert "ep_rew_mean" in run_log, "metric tables must be persisted to run.log"
+        anomaly_log = (Path(td) / "anomaly.log").read_text(encoding="utf-8")
+        assert "kl_explode" in anomaly_log, "events must mirror to anomaly.log"
         print("\nself-check passed")

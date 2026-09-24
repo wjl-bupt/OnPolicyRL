@@ -55,27 +55,53 @@ class RolloutSamples(NamedTuple):
 _CORE_ELEMENTS: tuple[str, ...] = tuple(RolloutSamples.__annotations__)
 
 
-def sample_class(extra: "tuple[str, ...] | list[str]") -> type:
-    """Build an extended sample class: the six core elements plus `extra`
-    element-level fields (in order), e.g. ``sample_class(("probs",))`` for an
-    estimator that stores the full action distribution per sample.
+class TrajectorySamples(NamedTuple):
+    """The element-level view of one **trajectory batch** (mode="trajectory").
 
-    Names must be valid identifiers and must not collide with the core. The
+    The six core elements are the same as `RolloutSamples`, but their tensors
+    are the trajectories of the batch **concatenated along the sample axis**;
+    `lengths` recovers per-trajectory views via ``split(lengths)``. `last_values`
+    is V(s_end) per trajectory, already zeroed where the trajectory ended on a
+    true termination (nothing to bootstrap from).
+
+    Fixed shapes do not exist here -- a batch is a variable number of variable
+    length trajectories, which is the point of the mode.
+    """
+
+    observations: "Tensor | dict[str, Tensor]"
+    actions: Tensor
+    old_values: Tensor
+    old_log_prob: Tensor
+    advantages: Tensor
+    returns: Tensor
+    lengths: Tensor       # [n_traj] int64
+    last_values: Tensor   # [n_traj] float32
+
+
+def sample_class(extra: "tuple[str, ...] | list[str]",
+                 base: type = RolloutSamples) -> type:
+    """Build an extended sample class: `base`'s elements plus `extra`
+    element-level fields (in order), e.g. ``sample_class(("probs",))`` for an
+    estimator that stores the full action distribution per sample, or
+    ``sample_class(("probs",), base=TrajectorySamples)`` in trajectory mode.
+
+    Names must be valid identifiers and must not collide with the base. The
     result is a real NamedTuple subclass: attribute access, unpacking and
     ``_asdict()`` all work. IDE support inside a run is best when the estimator
     assigns the return value to a module-level constant, so the extended shape
     is declared once and read everywhere.
     """
-    core = [n for n in _CORE_ELEMENTS if n != "observations"]
-    bad = [n for n in extra if not n.isidentifier() or n in core or n == "observations"]
+    core_names = tuple(base.__annotations__)
+    core = [n for n in core_names if n != "observations"]
+    bad = [n for n in extra if not n.isidentifier() or n in core_names]
     if bad:
         raise ValueError(
             f"invalid extra sample elements {bad}; they must be identifiers and "
-            f"must not collide with the core elements {_CORE_ELEMENTS}"
+            f"must not collide with the base elements {core_names}"
         )
-    ordered: list[tuple[str, Any]] = [(n, Any) for n in _CORE_ELEMENTS]
+    ordered: list[tuple[str, Any]] = [(n, Any) for n in core_names]
     ordered += [(n, Any) for n in extra]
-    return NamedTuple("RolloutSamples", ordered)  # type: ignore[return-value]
+    return NamedTuple(base.__name__, ordered)  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -168,21 +194,49 @@ class MinibatchSpec:
     algo_design §9.2 -- a framework stage, parameterized here, never redefined
     per algorithm).
 
-    mode "flat"     shuffle [T*N] valid samples into equal minibatches.
-    mode "sequence" cut by (env, time-block), preserving time within a block;
-                    fields whose SampleOp is FLATTEN cannot appear in sequence
-                    samples -- reserved for recurrent policies.
+    mode "flat"       shuffle [T*N] valid samples into `num_minibatches` equal
+                      minibatches (feed-forward path).
+    mode "trajectory" pack **whole trajectories** (the buffer's contiguous
+                      segments) into batches: trajectories are shuffled, then
+                      drawn one by one until the batch holds about
+                      `trajectory_frames` samples ("≈ m"; a batch is always ≥
+                      the target -- a trajectory is never cut). With
+                      `trajectory_frames=None` the target is derived from
+                      `num_minibatches` as total_frames / num_minibatches, so
+                      the rollout still ends up in roughly that many batches.
+                      A trailing batch holding fewer than `min_trajectories`
+                      trajectories is discarded (0 disables dropping). Time is
+                      preserved inside each trajectory; autoreset dummy steps
+                      belong to no trajectory and are excluded by construction.
 
-    drop_invalid: autoreset dummy steps are excluded from every minibatch here,
-    so the algorithm layer never needs to know autoreset exists.
+    drop_invalid is the flat-mode switch; trajectory mode excludes invalid
+    steps structurally, so it is not consulted there.
+
+    Fixed-length [L, B] blocks with recurrent states (the old "sequence" mode)
+    are not declared yet -- recurrent policies come later.
     """
 
     num_minibatches: int = 4
-    mode: str = "flat"           # "flat" | "sequence"
+    mode: str = "flat"                     # "flat" | "trajectory"
     drop_invalid: bool = True
+    trajectory_frames: int | None = None   # ≈ m samples per batch (trajectory mode)
+    min_trajectories: int = 2              # drop a smaller trailing batch; 0 keeps it
 
     def __post_init__(self) -> None:
-        if self.mode not in ("flat", "sequence"):
-            raise ValueError(f"mode must be 'flat' or 'sequence', got {self.mode!r}")
+        if self.mode not in ("flat", "trajectory"):
+            raise ValueError(
+                f"mode must be 'flat' or 'trajectory', got {self.mode!r} "
+                "(fixed-length recurrent blocks are not declared yet)"
+            )
         if self.num_minibatches < 1:
             raise ValueError(f"num_minibatches must be >= 1, got {self.num_minibatches}")
+        if self.mode == "flat" and (self.trajectory_frames is not None
+                                    or self.min_trajectories != 2):
+            raise ValueError(
+                "trajectory_frames / min_trajectories are trajectory-mode "
+                "options; set mode='trajectory' or remove them"
+            )
+        if self.trajectory_frames is not None and self.trajectory_frames < 1:
+            raise ValueError(f"trajectory_frames must be >= 1, got {self.trajectory_frames}")
+        if self.min_trajectories < 0:
+            raise ValueError(f"min_trajectories must be >= 0, got {self.min_trajectories}")

@@ -129,6 +129,8 @@ def base_schema(obs_space, act_space) -> BufferSchema:
     schema["terminated"] = Field((), torch.bool, doc="cuts the bootstrap")
     schema["truncated"] = Field((), torch.bool, doc="keeps the bootstrap")
     schema["valid"] = Field((), torch.bool, doc="False = autoreset dummy step")
+    # schema["last_obs"] = Field(_space_shape(obs_space), _dtype(obs_space), doc=f"last observation in rollout ending")
+    # schema["last_value"] =  Field((), torch.float32, extra_step=True, doc=f"V(s_t) corresponding to last_obs")
     return schema
 
 

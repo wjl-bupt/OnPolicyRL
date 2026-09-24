@@ -25,6 +25,8 @@ _FAMILIES: list[tuple[str, re.Pattern]] = [
     ("mujoco", re.compile(
         r"^(HalfCheetah|Ant|Walker2d|Hopper|Humanoid|Swimmer|Reacher|"
         r"InvertedPendulum|InvertedDoublePendulum|Pusher)")),
+    ("classic", re.compile(
+        r"^(CartPole|Acrobot|Pendulum|MountainCar|LunarLander|BipedalWalker)")),
 ]
 
 _ENVPOOL_FAMILIES = {"atari", "minigrid"}
@@ -97,6 +99,12 @@ def make_env(
         except ImportError:
             from minigrid_env import make_minigrid_env, make_minigrid_envpool
         build = make_minigrid_env if backend == "gymnasium" else make_minigrid_envpool
+    elif family == "classic":
+        try:
+            from common.env.classic_env import make_classic_env
+        except ImportError:
+            from classic_env import make_classic_env
+        build = make_classic_env
     else:
         try:
             from common.env.mujoco_env import make_mujoco_env

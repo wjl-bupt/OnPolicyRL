@@ -1,60 +1,50 @@
 # -*- encoding: utf-8 -*-
-'''
-@File :layers.py
-@Created-Time :2026-09-16 11:39:15
-@Author  :june
-@Description   : base layers implement
-@Modified-Time : 2026-09-16 11:39:15
-'''
+"""MLP feature extractor for the network axis (S0).
 
-import torch as th
+`obs -> features`: a stack of Linear+activation whose last width is `out_dim`,
+which the actor/value heads read. Vector obs only -- image obs go through
+architecture/cnn.py, dict obs need a combined extractor (not wired yet).
+
+Not normalized here: scaling vector observations is a normalizer's job (S0,
+config), not the extractor's. Obs are only cast to float.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import numpy as np
 import torch.nn as nn
-from typing import List
+from torch import Tensor
 
-class MlpLayers(nn.Module):
+from architecture.init import layer_init
+
+
+class MlpExtractor(nn.Module):
+    """`in_dim -> net_arch` hidden stack; `out_dim` is the final hidden width.
+
+    Example::
+
+        ex = MlpExtractor(4, (64, 64))     # ex.out_dim == 64
+    """
+
     def __init__(
-        self, 
-        in_d : int,
-        out_d : int, 
-        hidden_dims: List | int = 256,
-        activation_fn: type[nn.Module] = nn.ReLU,
-        squash_output: bool = False,
-        use_bias: bool = True,
-        init_func: None = None,
-        pre_linear_modules: list[type[nn.Module]] | None = None,
-        post_linear_modules: list[type[nn.Module]] | None = None,
+        self,
+        in_dim: int,
+        net_arch: Sequence[int] = (64, 64),
+        activation: type[nn.Module] = nn.Tanh,
+        ortho: bool = True,
     ):
-        self.in_d = in_d
-        self.out_d = out_d
-        self.use_bias = use_bias
-        self.init_func = init_func
-        self.activation_fn = activation_fn
-        self.squash_output = squash_output
-        self.hidden_dims = hidden_dims if isinstance(list, hidden_dims) else [hidden_dims]
-        self.net_arch = [self.in_d] + self.hidden_dims + [self.out_d]
-        self.layers = []
+        super().__init__()
+        sizes = [int(in_dim), *[int(h) for h in net_arch]]
+        layers: list[nn.Module] = []
+        for i, o in zip(sizes[:-1], sizes[1:]):
+            lin = nn.Linear(i, o)
+            if ortho:
+                layer_init(lin, gain=np.sqrt(2))
+            layers += [lin, activation()]
+        self.net = nn.Sequential(*layers)
+        self.out_dim = sizes[-1]
 
-        # Hidden layers
-        for in_d, out_d in zip(self.net_arch[:-2], self.net_arch[1:-1]):
-            self.layers.extend(pre_linear_modules)
-            self.layers.append(
-                nn.Linear(in_d, out_d, bias=self.use_bias)
-            )
-            self.layers.extend(post_linear_modules)
-            self.layers.append(self.activation_fn)
-        # Output layer
-        self.layers.append(
-            nn.Linear(
-                self.net_arch[-2],
-                self.net_arch[-1],
-                bias=self.use_bias,
-            )
-        )
-        if self.squash_output:
-            self.layers.append(nn.Tanh())
-
-        self.layers = nn.Sequential(*self.layers)
-    
-    def forward(self, x):
-        return self.layers(x)
-        
+    def forward(self, obs: Tensor) -> Tensor:
+        return self.net(obs.float())

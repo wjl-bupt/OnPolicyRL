@@ -13,6 +13,7 @@ from protocol.sample import (
     RolloutSamples,
     SampleMapping,
     SampleOp,
+    TrajectorySamples,
     sample_class,
     validate_against_schema,
 )
@@ -65,8 +66,31 @@ def test_minibatch_spec_rejects_bad_modes_and_counts():
     assert MinibatchSpec().mode == "flat"
     with pytest.raises(ValueError, match="mode must be"):
         MinibatchSpec(mode="random")
+    with pytest.raises(ValueError, match="mode must be"):
+        MinibatchSpec(mode="sequence")   # recurrent blocks are not declared yet
     with pytest.raises(ValueError, match="num_minibatches"):
         MinibatchSpec(num_minibatches=0)
+
+
+def test_minibatch_spec_trajectory_options_belong_to_trajectory_mode():
+    spec = MinibatchSpec(mode="trajectory", trajectory_frames=512, min_trajectories=2)
+    assert spec.trajectory_frames == 512
+    with pytest.raises(ValueError, match="trajectory-mode options"):
+        MinibatchSpec(mode="flat", trajectory_frames=512)
+    with pytest.raises(ValueError, match="trajectory-mode options"):
+        MinibatchSpec(mode="flat", min_trajectories=0)
+    with pytest.raises(ValueError, match="trajectory_frames"):
+        MinibatchSpec(mode="trajectory", trajectory_frames=0)
+
+
+def test_trajectory_samples_declaration():
+    assert TrajectorySamples._fields == (
+        "observations", "actions", "old_values", "old_log_prob",
+        "advantages", "returns", "lengths", "last_values")
+    ext = sample_class(("probs",), base=TrajectorySamples)
+    assert ext._fields == (*TrajectorySamples._fields, "probs")
+    with pytest.raises(ValueError, match="must not collide"):
+        sample_class(("lengths",), base=TrajectorySamples)
 
 
 def test_sample_op_is_a_closed_set():

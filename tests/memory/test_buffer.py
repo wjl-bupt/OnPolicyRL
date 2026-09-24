@@ -107,12 +107,12 @@ def test_whole_extra_passes_through_uncut():
 def test_core_sample_field_must_be_flatten():
     sch = _schema()
     sch["action"] = Field((), torch.long, sample_op=FieldSampleOp.WHOLE)
-    with pytest.raises(ValueError, match="must be FLATTEN"):
+    with pytest.raises(ValueError, match="cut per sample in flat mode"):
         RolloutBuffer(T, N, sch)
 
 
-def test_sequence_mode_is_reserved():
-    with pytest.raises(NotImplementedError, match="sequence"):
+def test_sequence_mode_is_not_declared_yet():
+    with pytest.raises(ValueError, match="mode must be"):
         RolloutBuffer(T, N, _schema(), spec=MinibatchSpec(mode="sequence"))
 
 
@@ -190,6 +190,134 @@ def test_advantages_are_estimator_slots_not_writable():
     buf = RolloutBuffer(T, N, _schema())
     with pytest.raises(KeyError, match="undeclared"):
         buf.write(advantages=torch.zeros(N))
+
+
+def test_sample_elements_are_aligned_by_name():
+    """Regression for a real bug: the assembly must place tensors BY ELEMENT
+    NAME. A positional zip once swapped old_values/old_log_prob (the mapping's
+    dataclass order differs from the NamedTuple's declaration order) -- nothing
+    raised, the policy just collapsed. Pin: the value element must be the
+    marker computed from the SAME rows as the observations element."""
+    buf = RolloutBuffer(T, N, _schema())
+    g = torch.Generator().manual_seed(0)
+    for t in range(T):
+        obs = torch.randn(N, OBS, generator=g)
+        buf.write_obs(obs)
+        buf.write(action=torch.randint(0, ACT, (N,), generator=g),
+                  logprob=torch.randn(N, generator=g),
+                  value=obs.sum(-1) + 100.0)            # row marker
+        buf.write_masks(_masks(t))
+        buf.advance()
+    buf.set_bootstrap_value(torch.zeros(N))
+    buf.set_estimates(torch.zeros(T, N), torch.zeros(T, N))
+    for data in buf.sample():
+        assert torch.allclose(data.old_values, data.observations.sum(-1) + 100.0), \
+            "old_values and observations came from different rows"
+
+
+# --------------------------------------------------------------------------- #
+#  trajectory mode
+# --------------------------------------------------------------------------- #
+
+
+def test_trajectory_mode_packs_whole_trajectories_to_target():
+    buf = RolloutBuffer(T, N, _schema(),
+                        spec=MinibatchSpec(mode="trajectory", trajectory_frames=12,
+                                           min_trajectories=0))
+    _fill(buf, term_at=5)      # per env: [0..6) terminated + [6..T) -> lengths 6,10
+    out = list(buf.sample(generator=torch.Generator().manual_seed(0)))
+    from protocol.sample import TrajectorySamples
+    assert out and all(isinstance(mb, TrajectorySamples) for mb in out)
+    # every batch reaches the target; nothing is dropped; all frames accounted for
+    assert all(int(mb.lengths.sum()) >= 12 for mb in out)
+    assert sum(int(mb.lengths.sum()) for mb in out) == T * N
+    assert all(mb.actions.shape[0] == int(mb.lengths.sum()) for mb in out)
+    assert {int(x) for mb in out for x in mb.lengths} == {6, 10}
+
+
+def test_trajectory_last_values_zeroed_on_true_termination():
+    buf = RolloutBuffer(T, N, _schema(),
+                        spec=MinibatchSpec(mode="trajectory", trajectory_frames=12,
+                                           min_trajectories=0))
+    _fill(buf, term_at=5)
+    out = list(buf.sample(generator=torch.Generator().manual_seed(1)))
+    for mb in out:
+        for length, lv in zip(mb.lengths, mb.last_values):
+            if int(length) == 6:        # ended on a true termination
+                assert float(lv) == 0.0
+            else:                        # ran to the boundary -> bootstrap value
+                assert float(lv) != 0.0
+
+
+def test_trajectory_mode_drops_small_trailing_batch():
+    """Drop rule, deterministically: the target (100) exceeds the whole rollout
+    (64 frames), so the trailing batch is ALL trajectories; with
+    min_trajectories=9 it is discarded and sample() yields nothing."""
+    buf = RolloutBuffer(T, N, _schema(),
+                        spec=MinibatchSpec(mode="trajectory", trajectory_frames=100,
+                                           min_trajectories=9))
+    _fill(buf, term_at=5)      # 8 trajectories (N=4 envs x 2 segments), 64 frames
+    out = list(buf.sample(generator=torch.Generator().manual_seed(0)))
+    assert out == []
+
+
+def test_trajectory_mode_keeps_everything_when_drop_disabled():
+    buf = RolloutBuffer(T, N, _schema(),
+                        spec=MinibatchSpec(mode="trajectory", trajectory_frames=100,
+                                           min_trajectories=0))
+    _fill(buf, term_at=5)
+    out = list(buf.sample(generator=torch.Generator().manual_seed(0)))
+    assert len(out) == 1                                    # one batch, no mid cut
+    assert out[0].lengths.shape[0] == 8 and int(out[0].lengths.sum()) == T * N
+
+
+def test_trajectory_batches_respect_target_and_drop_rule():
+    spec = MinibatchSpec(mode="trajectory", trajectory_frames=20, min_trajectories=3)
+    buf = RolloutBuffer(T, N, _schema(), spec=spec)
+    _fill(buf, term_at=5)
+    for seed in range(8):
+        out = list(buf.sample(generator=torch.Generator().manual_seed(seed)))
+        assert sum(int(mb.lengths.sum()) for mb in out) <= T * N
+        for i, mb in enumerate(out):
+            frames, n_traj = int(mb.lengths.sum()), mb.lengths.shape[0]
+            if i < len(out) - 1:                 # mid batches pack to the target
+                assert frames >= 20
+            else:                                # trailing: kept only if big enough
+                assert n_traj >= 3 or frames >= 20
+
+
+def test_trajectory_frames_none_derives_from_num_minibatches():
+    buf = RolloutBuffer(T, N, _schema(),
+                        spec=MinibatchSpec(mode="trajectory", num_minibatches=4,
+                                           min_trajectories=0))
+    _fill(buf, term_at=5)      # total 32 -> target 32/4 = 8
+    out = list(buf.sample(generator=torch.Generator().manual_seed(2)))
+    assert sum(int(mb.lengths.sum()) for mb in out) == T * N
+    assert all(int(mb.lengths.sum()) >= 8 for mb in out)
+
+
+def test_trajectory_mode_extras_follow_sample_op():
+    from protocol.sample import TrajectorySamples, sample_class
+    sch = _schema(extra=[("anchor", Field((), torch.float32,
+                                          sample_op=FieldSampleOp.WHOLE))])
+    buf = RolloutBuffer(T, N, sch,
+                        spec=MinibatchSpec(mode="trajectory", trajectory_frames=12,
+                                           min_trajectories=0),
+                        extra_samples=("anchor",))
+    assert buf._samples_cls.__name__ == "TrajectorySamples"
+    assert "anchor" in buf._samples_cls._fields
+    _fill(buf, term_at=5)
+    mb = next(iter(buf.sample(generator=torch.Generator().manual_seed(3))))
+    assert torch.equal(mb.anchor, buf["anchor"])
+
+
+def test_trajectory_mode_accepts_non_flatten_core():
+    """In trajectory mode the per-sample FLATTEN restriction is lifted: time is
+    preserved inside trajectories, so WHOLE core fields are legal."""
+    sch = _schema()
+    sch["action"] = Field((), torch.long, sample_op=FieldSampleOp.WHOLE)
+    buf = RolloutBuffer(T, N, sch, spec=MinibatchSpec(mode="trajectory"))
+    _fill(buf)
 
 
 # --------------------------------------------------------------------------- #

@@ -17,34 +17,28 @@ from torch import Tensor
 
 try:
     from protocol.buffer import BufferSchema, WriteOp, describe_schema
+    from protocol.masks import Masks
     from protocol.sample import (
         MinibatchSpec,
         RolloutSamples,
         SampleMapping,
         SampleOp,
+        TrajectorySamples,
         sample_class,
         validate_against_schema,
     )
 except ImportError:  # executed from inside src/memory/ without `src` on sys.path
     from protocol.buffer import BufferSchema, WriteOp, describe_schema  # type: ignore
+    from protocol.masks import Masks  # type: ignore
     from protocol.sample import (  # type: ignore
         MinibatchSpec,
         RolloutSamples,
         SampleMapping,
         SampleOp,
+        TrajectorySamples,
         sample_class,
         validate_against_schema,
     )
-
-
-class Masks(NamedTuple):
-    """The three rollout masks (DESIGN.md §4.1). The canonical definition will
-    move to src/protocol when the env adapter lands; the buffer only ever
-    exposes them together -- no API returns a collapsed `done`."""
-
-    terminated: Tensor
-    truncated: Tensor
-    valid: Tensor
 
 
 class RolloutBuffer:
@@ -88,27 +82,24 @@ class RolloutBuffer:
 
         # -- declaration cross-check: a wrong name dies here, not mid-run ----- #
         validate_against_schema(self._mapping, self.schema, self._extra_samples)
-        if self._spec.mode == "sequence":
-            raise NotImplementedError(
-                "sequence sampling is reserved for recurrent policies; use the "
-                "flat mode for feed-forward algorithms"
-            )
-        for name in self._extra_samples:
-            if self.schema[name].sample_op is SampleOp.SEQUENCE:
-                raise ValueError(
-                    f"extra sample field {name!r} has SampleOp.SEQUENCE, which the "
-                    f"flat spec cannot cut; use sequence mode (recurrent) or WHOLE"
-                )
-        for element, src in self._mapping.sources().items():
-            if element in ("advantages", "returns"):
-                continue
-            if src in self.schema and self.schema[src].sample_op is not SampleOp.FLATTEN:
-                raise ValueError(
-                    f"core sample element {element!r} maps to {src!r} with "
-                    f"sample_op={self.schema[src].sample_op.value}; core elements "
-                    f"are cut per sample and must be FLATTEN (declare WHOLE "
-                    f"fields as extra_samples instead)"
-                )
+        if self._spec.mode == "flat":
+            for name in self._extra_samples:
+                if self.schema[name].sample_op is SampleOp.SEQUENCE:
+                    raise ValueError(
+                        f"extra sample field {name!r} has SampleOp.SEQUENCE, which "
+                        f"the flat spec cannot cut; use WHOLE or mode='trajectory'"
+                    )
+            for element, src in self._mapping.sources().items():
+                if element in ("advantages", "returns"):
+                    continue
+                if src in self.schema and self.schema[src].sample_op is not SampleOp.FLATTEN:
+                    raise ValueError(
+                        f"core sample element {element!r} maps to {src!r} with "
+                        f"sample_op={self.schema[src].sample_op.value}; core "
+                        f"elements are cut per sample in flat mode (declare WHOLE "
+                        f"fields as extra_samples instead, or use "
+                        f"mode='trajectory')"
+                    )
 
         # -- allocation: one tensor per field, static shapes ------------------ #
         self._buf: dict[str, Tensor] = {}
@@ -120,8 +111,9 @@ class RolloutBuffer:
         self.advantages = torch.zeros((self.T, self.N), device=self.device)
         self.returns = torch.zeros((self.T, self.N), device=self.device)
         self.pos = 0
-        self._samples_cls = (sample_class(self._extra_samples)
-                             if self._extra_samples else RolloutSamples)
+        base_cls = TrajectorySamples if self._spec.mode == "trajectory" else RolloutSamples
+        self._samples_cls = (sample_class(self._extra_samples, base=base_cls)
+                             if self._extra_samples else base_cls)
 
     # ------------------------------ write ------------------------------- #
 
@@ -233,40 +225,126 @@ class RolloutBuffer:
 
     def sample(self, generator: torch.Generator | None = None
                ) -> Iterator[RolloutSamples]:
-        """Yield minibatches: protocol-declared NamedTuples, invalid steps
-        dropped, deterministic under `generator`."""
-        if self._spec.mode != "flat":  # guarded again: spec may differ per call site
-            raise NotImplementedError("sequence sampling is not implemented yet")
+        """Yield minibatches per the declared spec: flat mode yields shuffled
+        per-sample batches; trajectory mode yields packed whole-trajectory
+        batches. Deterministic under `generator`; invalid steps never appear."""
+        if self._spec.mode == "flat":
+            yield from self._sample_flat(generator)
+        else:
+            yield from self._sample_trajectories(generator)
+
+    def _sample_flat(self, generator: torch.Generator | None) -> Iterator[Any]:
         valid = self._buf["valid"][: self.T].reshape(-1).bool()
         idx = torch.nonzero(valid, as_tuple=False).squeeze(-1)
         perm = idx[torch.randperm(idx.numel(), generator=generator,
                                   device=idx.device)]
-        n = max(1, perm.numel() // self._spec.num_minibatches)
-        for start in range(0, perm.numel(), n):
-            sel = perm[start:start + n]
-            if sel.numel() == 0:
-                continue
-            yield self._assemble(sel)
+        # tensor_split: sizes differ by at most 1 -- a fixed chunk size would
+        # dump the whole remainder into an orphan tail minibatch (possibly a
+        # single sample, whose std() is NaN and once killed a whole policy)
+        for sel in torch.tensor_split(perm, self._spec.num_minibatches):
+            if sel.numel() > 0:
+                yield self._assemble(sel)
 
-    def _assemble(self, sel: Tensor) -> RolloutSamples:
-        """One protocol sample: resolve every declared element from its source."""
-        args: list[Any] = []
+    def _sample_trajectories(self, generator: torch.Generator | None) -> Iterator[Any]:
+        """Pack whole trajectories up to `trajectory_frames` samples ("≈ m").
+
+        Trajectories are shuffled, then drawn until the batch holds at least the
+        target -- a trajectory is never cut, so a batch is ≥ target. The
+        trailing leftover is discarded when it holds fewer than
+        `min_trajectories` trajectories. Segments already exclude autoreset
+        dummy steps, so drop_invalid is structural here.
+        """
+        segs = self.segments()
+        if not segs:
+            return
+        total_frames = sum(e - s for _, s, e in segs)
+        target = self._spec.trajectory_frames or max(
+            1, total_frames // self._spec.num_minibatches)
+        order = torch.randperm(len(segs), generator=generator).tolist()
+        batch: list[tuple[int, int, int]] = []
+        frames = 0
+        for i in order:
+            n, s, e = segs[i]
+            batch.append((n, s, e))
+            frames += e - s
+            if frames >= target:
+                yield self._assemble_trajectory(batch)
+                batch, frames = [], 0
+        if batch and len(batch) >= self._spec.min_trajectories:
+            yield self._assemble_trajectory(batch)
+
+    def _assemble_trajectory(self, segs: list[tuple[int, int, int]]) -> Any:
+        """One trajectory batch: elements concatenated along the sample axis in
+        segment order, plus lengths and last_values (zeroed at true terminations).
+        Assembled by name -- see _assemble."""
+        kwargs: dict[str, Any] = {}
         for element, src in self._mapping.sources().items():
             if element == "observations":
-                args.append(self._obs_at(sel))
+                kwargs[element] = self._obs_concat(segs)
             elif src == "advantages":
-                args.append(self.advantages.reshape(-1)[sel])
+                kwargs[element] = self._src_concat(self.advantages, segs)
             elif src == "returns":
-                args.append(self.returns.reshape(-1)[sel])
+                kwargs[element] = self._src_concat(self.returns, segs)
             else:
-                args.append(self._flat(src)[sel])
+                kwargs[element] = self._src_concat(self._buf[src], segs)
+        kwargs["lengths"] = torch.tensor([e - s for _, s, e in segs], dtype=torch.long,
+                                         device=self.device)
+        kwargs["last_values"] = self._last_values(segs)
         for name in self._extra_samples:
             f = self.schema[name]
             if f.sample_op is SampleOp.WHOLE:
-                args.append(self._buf[name])            # passed through uncut
+                kwargs[name] = self._buf[name]
+            else:  # FLATTEN and SEQUENCE both concatenate along whole trajectories
+                kwargs[name] = self._src_concat(self._buf[name], segs)
+        return self._samples_cls(**kwargs)
+
+    def _src_concat(self, tensor: Tensor, segs: list[tuple[int, int, int]]) -> Tensor:
+        return torch.cat([tensor[s:e, n] for n, s, e in segs], dim=0)
+
+    def _obs_concat(self, segs: list[tuple[int, int, int]]) -> "Tensor | dict[str, Tensor]":
+        if "obs" in self._buf:
+            return self._src_concat(self._buf["obs"], segs)
+        return {k[4:]: self._src_concat(self._buf[k], segs)
+                for k in self._buf if k.startswith("obs.")}
+
+    def _last_values(self, segs: list[tuple[int, int, int]]) -> Tensor:
+        """V(s_end) per trajectory: the stored value one step past the segment's
+        end -- the bootstrap slot when the segment runs to the rollout boundary;
+        zero where the trajectory ended on a true termination."""
+        vals = []
+        term = self._buf["terminated"]
+        for n, _, e in segs:
+            v = self._buf["value"][e, n]
+            if bool(term[e - 1, n]):
+                v = torch.zeros_like(v)
+            vals.append(v)
+        return torch.stack(vals).to(torch.float32)
+
+    def _assemble(self, sel: Tensor) -> RolloutSamples:
+        """One protocol sample: resolve every declared element from its source.
+
+        Elements are assembled **by name, never by position** -- the mapping's
+        field order and the NamedTuple's field order are two different orders,
+        and a positional zip silently swaps old_values/old_log_prob (a real bug
+        this fixed; it surfaced as instant policy collapse with no error).
+        """
+        kwargs: dict[str, Any] = {}
+        for element, src in self._mapping.sources().items():
+            if element == "observations":
+                kwargs[element] = self._obs_at(sel)
+            elif src == "advantages":
+                kwargs[element] = self.advantages.reshape(-1)[sel]
+            elif src == "returns":
+                kwargs[element] = self.returns.reshape(-1)[sel]
             else:
-                args.append(self._flat(name)[sel])
-        return self._samples_cls(*args)
+                kwargs[element] = self._flat(src)[sel]
+        for name in self._extra_samples:
+            f = self.schema[name]
+            if f.sample_op is SampleOp.WHOLE:
+                kwargs[name] = self._buf[name]          # passed through uncut
+            else:
+                kwargs[name] = self._flat(name)[sel]
+        return self._samples_cls(**kwargs)
 
     def _flat(self, name: str) -> Tensor:
         return self._buf[name][: self.T].reshape(self.T * self.N,

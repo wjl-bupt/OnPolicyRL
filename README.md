@@ -1,35 +1,27 @@
-# oprl
+# OnPolicyRL
 
-A lightweight, **research-workflow-first** framework for single-agent **on-policy** RL:
-declare an experiment → run it with monitoring → get machine-readable results, curves and
-a comparison table. The algorithm side is a pluggable space whose built-in surface is the
-baseline surface (PPO clip + GAE, nothing else).
+A native on-policy RL research framework: self-owned PyTorch models, rollout storage, algorithm updates, experiment grids, monitoring, evaluation and checkpoints.
 
-## Current state: **design phase, code cleared**
+Algorithms: **PPO / GA2E / SPO / RVL / DAE / V-MPO**.
 
-All code (`src/`, `tests/`, `config/`, `diy/`, `examples/`) was removed on 2026-09-16 by
-decision of the author: the framework is being rebuilt from the design documents below,
-and implementation is done by the author directly. This repository currently contains
-**documentation only**; the previous implementation remains in git history
-(`d26abdf` and earlier).
+```bash
+cd ~/OnPolicyRL
+bash scripts/run_integrated.sh --list
+PYTHONPATH=src .venv-jax/bin/python -m oprl.cli configs/minatar.yaml --plan
+PYTHONPATH=src .venv-jax/bin/python -m oprl.cli configs/minatar.yaml
+```
 
-## The documents
+One configuration per environment family declares algorithms, environments, shared settings and sparse overrides. The compiler produces the jobs consumed by training and reporting. See [the family configuration protocol](doc/FAMILY_CONFIG.md). No Stable-Baselines3 runtime dependency or copied external algorithm package is used.
 
-| Document | Role |
-|---|---|
-| [`doc/algo_taxonomy.md`](doc/algo_taxonomy.md) | **Algorithm taxonomy** — on-policy branches by update mechanism (B1 PPO · B2 V-MPO · B3 TRPO reserved), each with its baseline as the branch foundation; variant lists; branch×slot availability |
-| [`doc/logger_design.md`](doc/logger_design.md) | **Logger / metrics design** — SB3-referenced: prefix auto-aggregation, `metrics.jsonl` as the authoritative source, `event()` anomaly channel (report-only), `history()` sliding window; acceptance test list |
-| [`doc/algo_design.md`](doc/algo_design.md) | **Algorithm-integration design (v3)** — unified component shape, `Batch`/`Rollout` contexts, `Estimate` + `Phase` slots, `UpdateRule` escape hatch; mapping table over known algorithm types; migration checklist (§10) |
-| [`doc/DESIGN_v2.md`](doc/DESIGN_v2.md) | Framework v2 — "experiment lifecycle + algorithm space" positioning, the full research pipeline (declare → run → monitor → report → search → discover, interfaces reserved), budgets |
-| [`doc/DESIGN.md`](doc/DESIGN.md) | v0.1 design rationale — the primitive-layer decisions (masks triple, declarative schema, Policy protocol, Logger) that still stand |
-| [`doc/fix.md`](doc/fix.md) | Historical architecture-fix log (v0.1 era) |
+- `src/architecture/`: native MLP/CNN, categorical/Gaussian heads, advantage/relative-value heads.
+- `src/protocol/`, `src/memory/`: policy/data contracts, masks, rollout storage and sampling.
+- `src/onpolicy/{ppo,ga2e,spo,rvl,dae,vmpo}.py`: algorithm mathematics and native updates.
+- `src/workflow/`, `src/common/`: experiment orchestration, logging, evaluation, checkpoints, reports.
+- `src/oprl/`: installed command entry only.
 
-## Rebuild entry points
+See [implementation and migration details](doc/INTEGRATION.md) and [validation](doc/VALIDATION.md). Historical design documents remain under `doc/`; the integration guide describes implemented behavior and limitations. The MinAtar configuration declares 50 benchmark jobs; MuJoCo is a small smoke configuration. Classic Control preserves the previous local CartPole settings, including its parameter sweep.
 
-1. **Algorithm layer** — implement against `doc/algo_design.md` §4–§8 (contexts, slots,
-   escape hatch) following the migration checklist in §10.
-2. **Lifecycle layer** — `doc/DESIGN_v2.md` §4–§8: experiment file → runner + monitor
-   (report-only) + checkpoint → report trio (`results.json` + curves + summary over
-   last-30%/10% and final evaluation) → space schema → discovery contract.
-3. **Roadmap** — `doc/DESIGN_v2.md` §12: R1 (slimming) done as design; R2a (interface
-   rebuild) → R2 (experiment + run) → R3 (report) → R4 (space) → R5 (discovery).
+
+## Code revisions and algorithm extensions
+
+See [commit-based runs, editable local configs, MinAtar sticky actions, and algorithm discovery](doc/REVISIONS_AND_ALGORITHMS.md).

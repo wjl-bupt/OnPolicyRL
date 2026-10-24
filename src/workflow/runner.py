@@ -28,6 +28,7 @@ if __name__ == "__main__" and __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import json
+import os
 import platform
 import traceback
 from dataclasses import asdict, is_dataclass
@@ -52,8 +53,10 @@ from workflow.report import report
 # --------------------------------------------------------------------------- #
 
 
-def _adapter(env_id: str, num_envs: int, seed: int, device: str) -> GymVectorAdapter:
-    return GymVectorAdapter(make_env(env_id, num_envs=num_envs, seed=seed),
+def _adapter(env_id: str, num_envs: int, seed: int, device: str, **env_params) -> GymVectorAdapter:
+    if env_params.get("backend") == "jax":
+        return make_env(env_id, num_envs=num_envs, seed=seed, device=device, **env_params)
+    return GymVectorAdapter(make_env(env_id, num_envs=num_envs, seed=seed, **env_params),
                             device=device)
 
 
@@ -140,12 +143,18 @@ def run_job(job: Job, device: str | None = None) -> dict:
     # fingerprint of THIS setup (resolved algo config + hardware) -- stamped into
     # every checkpoint's meta and checked before resuming into an old one.
     hw = _hardware(dev)
-    fp = fingerprint(asdict(cfg) if is_dataclass(cfg) else {"config": str(cfg)}, hw)
+    fp = fingerprint({"algo": job.algo, "algo_config": asdict(cfg), "network": job.config.get("network_params", {}), "env": job.env, "env_params": job.config.get("env_params", {}), "code_commit": os.environ.get("OPRL_SOURCE_COMMIT")}, hw)
 
     log = Logger(run_dir=run_dir)
+    env = None
     try:
-        env = _adapter(job.env, cfg.num_envs, job.seed, dev)
-        policy = build_policy(env.obs_space, env.action_space, _policy_config(job))
+        env = _adapter(job.env, cfg.num_envs, job.seed, dev, **job.config.get("env_params", {}))
+        import random
+        import numpy as np
+        random.seed(job.seed)
+        np.random.seed(job.seed)
+        th.manual_seed(job.seed)
+        policy = entry.build_policy(env.obs_space, env.action_space, _policy_config(job), cfg)
         policy.to(dev)                        # obs (adapter) + buffer live on `dev`;
         #                                       put the network there too (closes the
         #                                       device assembly -- CPU path is a no-op)
@@ -167,10 +176,11 @@ def run_job(job: Job, device: str | None = None) -> dict:
                     _reset_run(done, pool)
 
         mon_kw = dict(job.config.get("monitor", {}))
+        eval_num_envs = int(mon_kw.pop("eval_num_envs", 1))
         eval_seed = int(mon_kw.pop("eval_seed", job.seed + 10_000))
         monitor = Monitor(
             policy,
-            env_factory=lambda: _adapter(job.env, 1, eval_seed, dev),
+            env_factory=lambda: _adapter(job.env, eval_num_envs, eval_seed, dev, **job.config.get("env_params", {})),
             log=log, run_dir=run_dir, total_steps=cfg.total_steps,
             eval_seed=eval_seed,
             meta={"identity": job.identity, "label": job.label,
@@ -181,7 +191,6 @@ def run_job(job: Job, device: str | None = None) -> dict:
         )
 
         summary = entry.train(cfg, env, policy, log, monitor, resume=resume_state)
-        env.close()
         done.write_text(json.dumps({"identity": job.identity, **summary}) + "\n",
                         encoding="utf-8")
         log.success("job complete", **summary)
@@ -193,6 +202,8 @@ def run_job(job: Job, device: str | None = None) -> dict:
         return {"status": "failed", "label": job.label,
                 "run_dir": str(run_dir), "identity": job.identity}
     finally:
+        if env is not None:
+            env.close()
         log.close()
 
 

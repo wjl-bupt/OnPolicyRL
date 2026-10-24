@@ -31,6 +31,8 @@ import hashlib
 import json
 import os
 import re
+import random
+import numpy as np
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +53,9 @@ def save_checkpoint(path: str | Path, policy, *, global_step: int,
     payload: dict[str, Any] = {
         "policy": policy.state_dict(),
         "optimizer": opt.state_dict() if opt is not None else None,
+        "python_rng": random.getstate(),
+        "numpy_rng": np.random.get_state(),
+        "cuda_rng": th.cuda.get_rng_state_all() if th.cuda.is_available() else None,
         "torch_rng": th.get_rng_state(),          # ByteTensor on CPU
         "global_step": int(global_step),
         "iteration": int(iteration),
@@ -76,6 +81,10 @@ def load_checkpoint(path: str | Path, policy, *,
     opt = getattr(policy, "optimizer", None)
     if opt is not None and ckpt.get("optimizer") is not None:
         opt.load_state_dict(ckpt["optimizer"])
+    if "python_rng" in ckpt: random.setstate(ckpt["python_rng"])
+    if "numpy_rng" in ckpt: np.random.set_state(ckpt["numpy_rng"])
+    if ckpt.get("cuda_rng") is not None and th.cuda.is_available():
+        th.cuda.set_rng_state_all(ckpt["cuda_rng"])
     rng = ckpt.get("torch_rng")
     if rng is not None:
         # set_rng_state wants a CPU ByteTensor; map_location may have moved it

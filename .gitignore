@@ -23,3 +23,9 @@ venv/
 .DS_Store
 core
 runs/
+# Local integration validation scratch
+.integration-staging/
+
+# Isolated revision cache and JAX runtime
+.oprl/
+.venv-jax/

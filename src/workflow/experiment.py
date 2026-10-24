@@ -69,6 +69,7 @@ class Experiment:
     baseline: dict
     space: dict
     name: str
+    family_spec: dict | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -100,6 +101,9 @@ def load_experiment(path: str | Path) -> Experiment:
     data = _load_raw(path)
     if not isinstance(data, dict):
         raise ValueError("experiment file must be a mapping at the top level")
+    if "family" in data or "version" in data:
+        from workflow.family import parse_family
+        return parse_family(data, path)
     unknown = set(data) - _ALLOWED_TOP
     if unknown:
         raise ValueError(f"unknown top-level keys {sorted(unknown)}; "
@@ -191,6 +195,9 @@ def expand(exp: Experiment) -> list[Job]:
     starts. Empty space -> one experiment (the pure baseline). Each `space` value
     MUST be a list of candidates; a scalar there is a mistake (it belongs in the
     baseline) and raises."""
+    if exp.family_spec is not None:
+        from workflow.family import compile_family
+        return compile_family(exp)
     keys = list(exp.space.keys())
     for k in keys:
         if not isinstance(exp.space[k], (list, tuple)):
@@ -210,6 +217,10 @@ def expand(exp: Experiment) -> list[Job]:
             env_dir = _env_slug(env)
             for seed in range(exp.runs):                     # fixed seeds 0..runs-1
                 config = copy.deepcopy(resolved_base)
+                if env.lower().startswith('minatar/'):
+                    from common.env.minatar_options import sticky_probability
+                    params = config.setdefault('env_params', {})
+                    params['sticky_action_prob'] = sticky_probability(params.get('sticky_action_prob', 0.1))
                 jobs.append(Job(
                     algo=exp.algo, env=env, seed=seed, config=config,
                     run_dir=exp.run_dir / slug / env_dir / f"seed-{seed}",

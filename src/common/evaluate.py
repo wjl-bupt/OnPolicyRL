@@ -50,6 +50,10 @@ def evaluate(policy, env_factory: Callable[[], object], *, episodes: int = 10,
         policy.eval()                              # no-op today; correct if BN/dropout appears
     returns: list[float] = []
     lengths: list[float] = []
+    # Fixed quotas avoid favoring short episodes in vectorized evaluation.
+    n_envs = int(getattr(env, 'num_envs', 1))
+    targets = [(episodes + i) // n_envs for i in range(n_envs)]
+    counts = [0] * n_envs
     try:
         obs = env.reset(seed=seed)
         # generous safety cap: a runaway env must not hang the run forever
@@ -57,7 +61,14 @@ def evaluate(policy, env_factory: Callable[[], object], *, episodes: int = 10,
             action = _greedy_action(policy, obs) if deterministic \
                 else policy.act(obs)[0]
             obs, _reward, _masks, info = env.step(action)
-            for ep_ret, ep_len in info.get("_finished_episodes", []):
+            finished = info.get("_finished_episodes", [])
+            indices = info.get('_finished_episode_indices')
+            if n_envs > 1 and indices is None:
+                raise ValueError('Vector evaluation requires finished episode indices')
+            for index, (ep_ret, ep_len) in zip(indices if indices is not None else [0] * len(finished), finished):
+                if counts[index] >= targets[index]:
+                    continue
+                counts[index] += 1
                 returns.append(float(ep_ret))
                 lengths.append(float(ep_len))
             if len(returns) >= episodes:

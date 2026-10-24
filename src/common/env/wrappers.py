@@ -53,7 +53,7 @@ class ChannelsFirstWrapper(gym.ObservationWrapper):
         return np.transpose(obs, (2, 0, 1))
 
 
-def vectorize(factory, num_envs: int, seed: int | None = None, async_envs: bool = False):
+def vectorize(factory, num_envs: int, seed: int | None = None, async_envs: bool = False, autoreset_mode: str | None = None):
     """Build a Sync/AsyncVectorEnv from a single-env factory.
 
     When `seed` is given the vector env is reset immediately with per-env seeds
@@ -64,7 +64,8 @@ def vectorize(factory, num_envs: int, seed: int | None = None, async_envs: bool 
     a pickling error naturally. Sync is the default and what every builder uses.
     """
     make = gym.vector.AsyncVectorEnv if async_envs else gym.vector.SyncVectorEnv
-    venv = make([factory] * num_envs)
+    kwargs = {} if autoreset_mode is None else {"autoreset_mode": gym.vector.AutoresetMode(autoreset_mode)}
+    venv = make([factory] * num_envs, **kwargs)
     if seed is not None:
         venv.reset(seed=seed)
     return venv

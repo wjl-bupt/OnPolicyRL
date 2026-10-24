@@ -58,12 +58,19 @@ class PPOConfig:
     gae_lambda: float = 0.95
     normalize_advantage: bool = True   # per-minibatch; NOT the estimator's job
     # runtime
+    anneal_lr: bool = False
+    lr_min: float = 0.0
+    value_loss_scale: float = 0.5
     seed: int = 1
     device: str = "cpu"
     total_steps: int = 100_000
     log_interval: int = 10             # in updates
 
     def __post_init__(self) -> None:
+        if min(self.num_envs, self.rollout_len, self.total_steps, self.log_interval) < 1:
+            raise ValueError("rollout/runtime counts must be positive")
+        if not (0 <= self.gamma <= 1 and 0 <= self.gae_lambda <= 1):
+            raise ValueError("gamma and gae_lambda must lie in [0, 1]")
         if self.vf_epsilon is None:
             self.vf_epsilon = self.epsilon
         if self.num_mini_batch < 1 or self.ppo_epoch < 1:
@@ -138,19 +145,20 @@ class ClipPolicyLoss:
 
 
 class ValueLoss:
-    def __init__(self, vf_epsilon: float | None = None):
+    def __init__(self, vf_epsilon: float | None = None, scale: float = 0.5):
         self.vf_epsilon = vf_epsilon
-    
+        self.scale = scale
+
     def __call__(self, batch: Batch) -> tuple[Tensor, dict[str, float]]:
         if self.vf_epsilon is None:
-            loss = 0.5 * ((batch.value - batch.returns).square()).mean()
+            loss = self.scale * ((batch.value - batch.returns).square()).mean()
             return loss, {}
         else:
             v_clipped = batch.old_values + (batch.value - batch.old_values).clamp(
                 -self.vf_epsilon, self.vf_epsilon)
             l_unclipped = (batch.value - batch.returns) ** 2
             l_clipped = (v_clipped - batch.returns) ** 2
-            loss = 0.5 * th.max(l_unclipped, l_clipped).mean()
+            loss = self.scale * th.max(l_unclipped, l_clipped).mean()
             # true clip fraction: where the raw delta hit the range -- NOT where the
             # pessimistic max happened to take the clipped branch
             clipfrac = ((batch.value - batch.old_values).abs()
@@ -181,7 +189,7 @@ class PPO:
         self.policy_loss = ClipPolicyLoss(config.epsilon, config.clip_schedule,
                                           config.clip_range_min)
         self.value_loss = ValueLoss(config.vf_epsilon if config.use_value_clipped
-                                    else None)
+                                    else None, scale=config.value_loss_scale)
         self.timer = Timer()
         self._last_obs = None
         self.global_step = 0
@@ -308,6 +316,11 @@ class PPO:
         """The outer loop: collect -> estimate -> update -> report."""
         while self.global_step < self.config.total_steps:
             self._collect_rollout_()
+            if self.config.anneal_lr:
+                progress = min(1.0, self.global_step / self.config.total_steps)
+                for group in self.policy.optimizer.param_groups:
+                    initial = group.setdefault("initial_lr", group["lr"])
+                    group["lr"] = self.config.lr_min + (initial-self.config.lr_min)*(1-progress)
             self._compute_advantages_()
             stats = self._update_()
             self.num_updates += 1
@@ -374,17 +387,9 @@ def train(cfg: PPOConfig, env, policy, log: Logger | None = None,
     the outer `while global_step < total_steps` continues rather than restarting.
     Returns a small summary dict the runner records as the job result.
     """
-    from memory.buffer import RolloutBuffer
-    from protocol.buffer import base_schema
-    from protocol.sample import MinibatchSpec
+    from onpolicy._runtime import NativeLoop, run_algorithm
+    return run_algorithm(NativeLoop, cfg, env, policy, log, monitor, resume)
 
-    schema = base_schema(env.obs_space, env.action_space)
-    spec = MinibatchSpec(num_minibatches=cfg.num_mini_batch)
-    buf = RolloutBuffer(cfg.rollout_len, cfg.num_envs, schema,
-                        device=cfg.device, spec=spec)
-    ppo = PPO(env, policy, buf, cfg, log=log, monitor=monitor)
-    if resume:
-        ppo.global_step = int(resume.get("global_step", 0))
-        ppo.num_updates = int(resume.get("iteration", 0))
-    ppo.train()
-    return {"global_step": ppo.global_step, "iteration": ppo.num_updates}
+
+# Algorithm discovery contract (no central name/class mapping).
+CONFIG_CLASS = PPOConfig

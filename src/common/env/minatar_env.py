@@ -24,6 +24,7 @@ optional minatar dependency.
 from __future__ import annotations
 
 import gymnasium as gym
+from common.env.minatar_options import sticky_probability
 
 try:
     from common.env.wrappers import ChannelsFirstWrapper, vectorize
@@ -66,15 +67,18 @@ def make_minatar_env(
     *,
     channels_first: bool = True,
     frame_stack: int = 1,
+    autoreset_mode: str | None = None,
     async_envs: bool = False,
     use_default_wrappers: bool = True,
+    sticky_action_prob: float = 0.1,
     **gym_make_kwargs,
 ) -> gym.vector.VectorEnv:
     """Build a vectorized MinAtar env with the default wrapper stack."""
+    sticky = sticky_probability(sticky_action_prob)
 
     def _one() -> gym.Env:
         _register_minatar()
-        env = gym.make(env_id, **gym_make_kwargs)
+        env = gym.make(env_id, sticky_action_prob=sticky, **gym_make_kwargs)
         if not use_default_wrappers:
             return env
         env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -87,7 +91,7 @@ def make_minatar_env(
             env = stack(env, frame_stack)
         return env
 
-    return vectorize(_one, num_envs, seed, async_envs)
+    return vectorize(_one, num_envs, seed, async_envs, autoreset_mode)
 
 
 if __name__ == "__main__":

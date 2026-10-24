@@ -44,6 +44,8 @@ class PolicyConfig:
     net_arch: tuple[int, ...] = (64, 64)     # MLP hidden widths (vector obs)
     activation: type[nn.Module] = nn.Tanh    # MLP activation; CNN always uses ReLU
     share: bool = False                      # separate actor/critic (default); images force shared
+    image_encoder: str = "auto"
+    image_net_arch: tuple[int, ...] = ()
     features_dim: int = 512                  # CNN feature width
     ortho_init: bool = True
     log_std_init: float = 0.0                # Box only
@@ -118,6 +120,8 @@ class ActorCritic(nn.Module):
             self.extractor = extractors                       # a single nn.Module
         else:
             self.pi_extractor, self.vf_extractor = extractors  # a (pi, vf) pair
+        self.pi_post = nn.Identity()
+        self.vf_post = nn.Identity()
         self.policy_head = policy_head
         self.value_head = value_head
         self.optimizer: th.optim.Optimizer | None = None      # assembler fills this
@@ -126,7 +130,7 @@ class ActorCritic(nn.Module):
     def _features(self, obs) -> tuple[Tensor, Tensor]:
         if self.share:
             f = self.extractor(obs)
-            return f, f
+            return self.pi_post(f), self.vf_post(f)
         return self.pi_extractor(obs), self.vf_extractor(obs)
 
     def _value(self, feat_v: Tensor) -> Tensor:
@@ -159,7 +163,7 @@ class ActorCritic(nn.Module):
     def predict_value(self, obs) -> Tensor:
         """Bootstrap V(s_T) at the rollout boundary (S2)."""
         if self.share:
-            return self._value(self.extractor(obs))
+            return self._value(self.vf_post(self.extractor(obs)))
         return self._value(self.vf_extractor(obs))
 
 
@@ -193,6 +197,10 @@ def build_policy(obs_space, act_space, cfg: PolicyConfig | None = None) -> Actor
             scale = 255.0 if np.dtype(obs_space.dtype) == np.uint8 else 1.0
             specs = (ImageExtractor.NATURE if min(obs_shape[1], obs_shape[2]) >= 36
                      else ImageExtractor.MINATAR)
+            if cfg.image_encoder == "minatar_reference":
+                specs = ((32, 3, 1), (32, 3, 1))
+            elif cfg.image_encoder != "auto":
+                raise ValueError(f"Unknown image encoder: {cfg.image_encoder}")
             return ImageExtractor(obs_shape, cfg.features_dim, cfg.ortho_init,
                                   scale, specs)
         if len(obs_shape) != 1:
@@ -207,6 +215,12 @@ def build_policy(obs_space, act_space, cfg: PolicyConfig | None = None) -> Actor
         pi_ex, vf_ex = make_extractor(), make_extractor()
         extractors = (pi_ex, vf_ex)
         feat_dim = pi_ex.out_dim
+
+    post = None
+    if is_image and cfg.image_net_arch:
+        post = (MlpExtractor(feat_dim, cfg.image_net_arch, cfg.activation, cfg.ortho_init),
+                MlpExtractor(feat_dim, cfg.image_net_arch, cfg.activation, cfg.ortho_init))
+        feat_dim = post[0].out_dim
 
     aname = type(act_space).__name__
     if aname == "Discrete":
@@ -225,5 +239,7 @@ def build_policy(obs_space, act_space, cfg: PolicyConfig | None = None) -> Actor
         layer_init(value_head, gain=1.0)
 
     policy = ActorCritic(extractors, head, value_head, share)
+    if post is not None:
+        policy.pi_post, policy.vf_post = post
     policy.optimizer = cfg.optimizer_cls(policy.parameters(), lr=cfg.lr, eps=cfg.adam_eps)
     return policy

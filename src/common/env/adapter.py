@@ -14,12 +14,9 @@ autoreset semantics so the three masks seen by algorithms are always right:
   RAW (un-normalized) returns -- the learning curve must never see normalized
   rewards.
 
-Known approximation (documented, better than CleanRL): under NEXT_STEP, the
-observation at a truncation step IS the terminal observation, so the bootstrap
-for a truncated step lands on V(reset obs) via GAE's `values[t+1]` -- the exact
-splice (V(terminal obs)) needs the SAME_STEP mode's `info["final_observation"]`
-and is left to the estimator wiring; CleanRL in contrast treats truncation as
-termination outright.
+The transition successor is exposed as info['_transition_obs']. NEXT_STEP
+returns it directly; SAME_STEP truncations replace reset observations with the
+reported final observation, so value bootstraps never cross episode boundaries.
 """
 
 from __future__ import annotations
@@ -99,19 +96,36 @@ class GymVectorAdapter:
 
         info = dict(info) if isinstance(info, dict) else {}
         info["_finished_episodes"] = self._finished_episodes(info, reward, valid)
+        transition_obs = self._obs(obs)
+        if not self.next_step_autoreset and bool(trunc.any()):
+            final = info.get("final_obs", info.get("final_observation"))
+            if final is None:
+                raise ValueError("SAME_STEP truncation requires final_obs for correct bootstrap")
+            if isinstance(transition_obs, dict):
+                raise NotImplementedError("SAME_STEP final dict observations need an explicit adapter")
+            transition_obs = transition_obs.clone()
+            for i in trunc.nonzero().flatten().tolist():
+                transition_obs[i] = _to_tensor(final[i], self.device)
+        info["_transition_obs"] = transition_obs
         return self._obs(obs), rew, Masks(term, trunc, valid), info
 
     # ---------------------------- episode stats -------------------------- #
 
     @staticmethod
     def _finished_episodes(info: dict, reward, valid: Tensor) -> list[tuple[float, int]]:
+        if "episode" not in info and isinstance(info.get("final_info"), dict):
+            nested = dict(info["final_info"])
+            if "_episode" not in nested and "_final_info" in info:
+                nested["_episode"] = info["_final_info"]
+            return GymVectorAdapter._finished_episodes(nested, reward, valid)
         ep = info.get("episode")
         if not ep:
             return []
         r, l = np.asarray(ep["r"]), np.asarray(ep["l"])
         out = []
+        present = np.asarray(info.get("_episode", np.ones(len(r), dtype=bool)))
         for i in range(len(r)):
-            if not np.isnan(r[i]):          # only the envs that finished now
+            if present[i] and bool(valid[i]) and not np.isnan(r[i]):          # only the envs that finished now
                 out.append((float(r[i]), int(l[i])))
         return out
 

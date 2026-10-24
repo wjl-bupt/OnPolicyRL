@@ -4,8 +4,9 @@
     make_env("Pong-v5",     backend="envpool",   num_envs=64)  -> envpool env
     make_env("MiniGrid-DoorKey-5x5-v0", ...)                   -> gymnasium | envpool
 
-Backend availability follows the benchmark matrix: envpool covers **atari and
-minigrid**; minatar and mujoco are gymnasium-only. `backend="auto"` picks
+The JAX backend returns a tensor-protocol adapter directly for MinAtar and
+MJX/<task>. Its `device` controls torch outputs; `jax_platform` controls simulation.
+Envpool covers **atari and minigrid**. `backend="auto"` picks
 gymnasium, the reference path everywhere; envpool is the throughput option for
 the two families that ship it.
 
@@ -62,6 +63,9 @@ def make_env(
     **kwargs,
 ):
     """Build an env via the family builder. `backend="auto"` == "gymnasium"."""
+    if backend == "jax":
+        from common.env.jax_adapter import JaxVectorAdapter
+        return JaxVectorAdapter(env_id, num_envs=num_envs, seed=seed, **kwargs)
     family = detect_family(env_id)
     backend = "gymnasium" if backend == "auto" else backend
     if family == "unknown":

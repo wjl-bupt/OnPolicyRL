@@ -1,0 +1,29 @@
+# One environment family; select algorithms and environments here.
+version: 2
+family: classic_control
+algo: ppo
+envs:
+- CartPole-v1
+runs: 2
+resume: false
+train:
+  num_envs: 8
+  rollout_len: 128
+  ppo_epoch: 256
+  num_mini_batch: 4
+  total_steps: 10000000
+  use_value_clipped: false
+  gae_lambda: 0.95
+model:
+  net_arch:
+  - 256
+  - 256
+  lr: 0.0003
+evaluation:
+  eval_interval: 500
+  eval_episodes: 10
+  ckpt_count: 3
+sweep:
+  train.epsilon:
+  - 0.1
+  - 0.2

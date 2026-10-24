@@ -1,37 +1,55 @@
-"""Algorithm registry -- the single L4 -> L2 seam (algo_design §1).
-
-The workflow layer treats an algorithm as a black box with exactly one entry:
-
-    train(cfg, env, policy, log, monitor, resume) -> summary dict
-
-`get_algo(name)` returns that entry plus the algorithm's config dataclass (so the
-runner can build `cfg` from the experiment file's `algo_params`). This module is
-the ONLY place under workflow/ that imports onpolicy/ -- the dependency
-discipline that keeps L4 from reaching into an algorithm's internals. Adding
-V-MPO later is one `elif` here; nothing else in workflow/ changes.
-"""
-
-from __future__ import annotations
-
+"""Discover algorithm modules lazily; extend via oprl.algorithms entry points."""
 from dataclasses import dataclass
+from importlib import import_module, metadata
+from pkgutil import iter_modules
 from typing import Callable
 
-_BUILTIN = ("ppo",)
+
+def _default_policy(obs, action, network, algo):
+    from architecture.actor_critic import build_policy
+    return build_policy(obs, action, network)
 
 
 @dataclass(frozen=True)
 class AlgoEntry:
-    """What the runner needs to run an algorithm without importing it."""
+    train: Callable
+    config_cls: type
+    build_policy: Callable = _default_policy
 
-    train: Callable          # (cfg, env, policy, log, monitor, resume) -> dict
-    config_cls: type         # the algorithm's hyperparameter dataclass
+
+def _key(name):
+    return str(name).lower().replace('-', '')
 
 
-def get_algo(name: str) -> AlgoEntry:
-    key = str(name).lower()
-    if key == "ppo":
-        # imported lazily and locally: registry is the seam, so the import lives
-        # here and nowhere else in the workflow layer.
-        from onpolicy.ppo import PPOConfig, train
-        return AlgoEntry(train=train, config_cls=PPOConfig)
-    raise ValueError(f"unknown algo {name!r}; built-in algorithms: {list(_BUILTIN)}")
+def _catalog():
+    import onpolicy
+    modules = {_key(m.name): m.name for m in iter_modules(onpolicy.__path__) if not m.name.startswith(('_', 'test_'))}
+    plugins = {}
+    for ep in metadata.entry_points(group='oprl.algorithms'):
+        key = _key(ep.name)
+        if key in modules or key in plugins:
+            raise ValueError(f'duplicate algorithm name: {ep.name}')
+        plugins[key] = ep
+    return modules, plugins
+
+
+def list_algorithms():
+    modules, plugins = _catalog()
+    return tuple(sorted(set(modules) | set(plugins)))
+
+
+def get_algo(name):
+    key = _key(name)
+    modules, plugins = _catalog()
+    if key in plugins:
+        provider = plugins[key].load()
+        entry = provider if isinstance(provider, AlgoEntry) else provider()
+        if not isinstance(entry, AlgoEntry):
+            raise TypeError(f'{name}: entry point must provide AlgoEntry')
+        return entry
+    if key not in modules:
+        raise ValueError(f'unknown algo {name!r}; available: {list_algorithms()}')
+    mod = import_module('onpolicy.' + modules[key])
+    if not isinstance(getattr(mod, 'CONFIG_CLASS', None), type) or not callable(getattr(mod, 'train', None)):
+        raise TypeError(f'{mod.__name__} must export CONFIG_CLASS and train')
+    return AlgoEntry(mod.train, mod.CONFIG_CLASS, getattr(mod, 'build_policy', _default_policy))

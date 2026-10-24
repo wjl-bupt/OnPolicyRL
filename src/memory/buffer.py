@@ -365,9 +365,9 @@ class RolloutBuffer:
         or the rollout boundary. A view over the same storage -- estimators
         whose objective needs contiguous time index through these spans.
         """
-        term = self._buf["terminated"][: self.T].bool()
-        trunc = self._buf["truncated"][: self.T].bool()
-        invalid = ~self._buf["valid"][: self.T].bool()
+        term = self._buf["terminated"][: self.T].detach().cpu().numpy().astype(bool)
+        trunc = self._buf["truncated"][: self.T].detach().cpu().numpy().astype(bool)
+        invalid = ~self._buf["valid"][: self.T].detach().cpu().numpy().astype(bool)
         out: list[tuple[int, int, int]] = []
         for n in range(self.N):
             start = None

@@ -34,7 +34,9 @@ except ImportError:  # executed from inside src/common/env/
 
 
 def _to_tensor(x, device: th.device, dtype: th.dtype | None = None) -> Tensor:
-    t = th.as_tensor(np.asarray(x), device=device)
+    array = np.asarray(x)
+    if not array.flags.writeable: array = array.copy()
+    t = th.as_tensor(array, device=device)
     return t.to(dtype) if dtype is not None else t
 
 
@@ -96,15 +98,25 @@ class GymVectorAdapter:
 
         info = dict(info) if isinstance(info, dict) else {}
         info["_finished_episodes"] = self._finished_episodes(info, reward, valid)
+        episode_info = info if 'episode' in info else info.get('final_info', {})
+        if isinstance(episode_info, dict) and 'episode' in episode_info:
+            present = np.asarray(episode_info.get('_episode', info.get('_final_info', np.ones(self.num_envs, dtype=bool))))
+            indices = [i for i in range(self.num_envs) if present[i] and bool(valid[i]) and not np.isnan(episode_info['episode']['r'][i])]
+        else:
+            indices = []
+        info['_finished_episode_indices'] = indices
+        if isinstance(episode_info, dict) and 'achievements' in episode_info:
+            info['_finished_achievements'] = [np.asarray(episode_info['achievements'][i]).tolist() for i in indices]
+
         transition_obs = self._obs(obs)
-        if not self.next_step_autoreset and bool(trunc.any()):
+        if not self.next_step_autoreset and bool((term | trunc).any()):
             final = info.get("final_obs", info.get("final_observation"))
             if final is None:
                 raise ValueError("SAME_STEP truncation requires final_obs for correct bootstrap")
             if isinstance(transition_obs, dict):
                 raise NotImplementedError("SAME_STEP final dict observations need an explicit adapter")
             transition_obs = transition_obs.clone()
-            for i in trunc.nonzero().flatten().tolist():
+            for i in (term | trunc).nonzero().flatten().tolist():
                 transition_obs[i] = _to_tensor(final[i], self.device)
         info["_transition_obs"] = transition_obs
         return self._obs(obs), rew, Masks(term, trunc, valid), info

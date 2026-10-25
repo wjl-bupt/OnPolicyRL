@@ -27,6 +27,8 @@ from torch.distributions import Categorical, Normal
 def _greedy_action(policy, obs) -> th.Tensor:
     """The distribution's mode -- argmax (Categorical) / mean (Normal). Falls
     back to a sample for any other distribution (best effort)."""
+    if callable(getattr(policy, 'predict_action', None)):
+        return policy.predict_action(obs, deterministic=True)
     d = policy.dist(obs)
     if isinstance(d, Categorical):
         return d.probs.argmax(dim=-1)
@@ -50,6 +52,7 @@ def evaluate(policy, env_factory: Callable[[], object], *, episodes: int = 10,
         policy.eval()                              # no-op today; correct if BN/dropout appears
     returns: list[float] = []
     lengths: list[float] = []
+    achievements = []
     # Fixed quotas avoid favoring short episodes in vectorized evaluation.
     n_envs = int(getattr(env, 'num_envs', 1))
     targets = [(episodes + i) // n_envs for i in range(n_envs)]
@@ -65,12 +68,15 @@ def evaluate(policy, env_factory: Callable[[], object], *, episodes: int = 10,
             indices = info.get('_finished_episode_indices')
             if n_envs > 1 and indices is None:
                 raise ValueError('Vector evaluation requires finished episode indices')
-            for index, (ep_ret, ep_len) in zip(indices if indices is not None else [0] * len(finished), finished):
+            completed_achievements = info.get("_finished_achievements", [])
+            for position, (index, (ep_ret, ep_len)) in enumerate(zip(indices if indices is not None else [0] * len(finished), finished)):
                 if counts[index] >= targets[index]:
                     continue
                 counts[index] += 1
                 returns.append(float(ep_ret))
                 lengths.append(float(ep_len))
+                if position < len(completed_achievements):
+                    achievements.append(completed_achievements[position])
             if len(returns) >= episodes:
                 break
     finally:
@@ -86,9 +92,15 @@ def evaluate(policy, env_factory: Callable[[], object], *, episodes: int = 10,
                 "eval/ep_len_mean": float("nan"), "eval/n_episodes": 0.0}
     rew = th.tensor(returns)
     length = th.tensor(lengths)
-    return {
+    result = {
         "eval/ep_rew_mean": float(rew.mean()),
         "eval/ep_rew_std": float(rew.std(unbiased=False)),   # 1-episode std = 0, not NaN
         "eval/ep_len_mean": float(length.mean()),
         "eval/n_episodes": float(n),
     }
+
+    if achievements:
+        rates = th.tensor(achievements, dtype=th.float32).gt(0).float().mean(0)
+        result.update({f'eval/achievement_{i}': float(r) for i, r in enumerate(rates)})
+        result['eval/achievements_mean'] = float(rates.sum())
+    return result

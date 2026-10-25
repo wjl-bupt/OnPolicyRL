@@ -54,10 +54,9 @@ from workflow.report import report
 
 
 def _adapter(env_id: str, num_envs: int, seed: int, device: str, **env_params) -> GymVectorAdapter:
-    if env_params.get("backend") == "jax":
-        return make_env(env_id, num_envs=num_envs, seed=seed, device=device, **env_params)
-    return GymVectorAdapter(make_env(env_id, num_envs=num_envs, seed=seed, **env_params),
-                            device=device)
+    from common.env.factory import make_tensor_env
+    return make_tensor_env(env_id, num_envs=num_envs, seed=seed, device=device, **env_params)
+
 
 
 def _algo_config(job: Job, config_cls: type, device: str | None):
@@ -165,6 +164,8 @@ def run_job(job: Job, device: str | None = None) -> dict:
                 saved_fp = peek_checkpoint(latest).get("meta", {}).get("fingerprint")
                 if saved_fp == fp:
                     resume_state = load_checkpoint(latest, policy)
+                    if resume_state.get("env_state") is not None:
+                        env.load_state_dict(resume_state["env_state"])
                     log.info("resumed from checkpoint", ckpt=latest.name,
                              **{k: resume_state[k]
                                 for k in ("global_step", "iteration")})
@@ -178,9 +179,21 @@ def run_job(job: Job, device: str | None = None) -> dict:
         mon_kw = dict(job.config.get("monitor", {}))
         eval_num_envs = int(mon_kw.pop("eval_num_envs", 1))
         eval_seed = int(mon_kw.pop("eval_seed", job.seed + 10_000))
+        def evaluation_env():
+            result = _adapter(job.env, eval_num_envs, eval_seed, dev, **job.config.get("env_params", {}))
+            if hasattr(result, 'training'):
+                result.training = False
+                result.load_state_dict(env.state_dict())
+            return result
+
+        def checkpoint_with_env(path, policy, **kwargs):
+            from common.checkpoint import save_checkpoint
+            save_checkpoint(path, policy, env_state=env.state_dict() if hasattr(env, 'state_dict') else None, **kwargs)
+
+        (run_dir / 'environment.json').write_text(json.dumps(getattr(env, 'provenance', {}), indent=2, default=str))
         monitor = Monitor(
             policy,
-            env_factory=lambda: _adapter(job.env, eval_num_envs, eval_seed, dev, **job.config.get("env_params", {})),
+            env_factory=evaluation_env, save_fn=checkpoint_with_env,
             log=log, run_dir=run_dir, total_steps=cfg.total_steps,
             eval_seed=eval_seed,
             meta={"identity": job.identity, "label": job.label,

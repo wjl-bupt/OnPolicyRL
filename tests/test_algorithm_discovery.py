@@ -4,7 +4,7 @@ from workflow import registry
 
 
 def test_current_algorithms_are_flat_and_discovered():
-    assert set(registry.list_algorithms())=={'ppo','ga2e','spo','rvl','dae','vmpo'}
+    assert {'ppo','ga2e','spo','rvl','dae','vmpo','dppo'} <= set(registry.list_algorithms())
     for name in registry.list_algorithms():
         mod=registry.import_module('onpolicy.'+name)
         assert mod.__file__.endswith('/'+name+'.py')

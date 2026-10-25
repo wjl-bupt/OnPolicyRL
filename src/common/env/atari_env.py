@@ -68,6 +68,7 @@ def make_atari_env(
     terminal_on_life_loss: bool = False,
     fire_reset: bool = False,
     frame_stack: int = 4,
+    autoreset_mode: str | None = None,
     async_envs: bool = False,
     use_default_wrappers: bool = True,
     **gym_make_kwargs,
@@ -96,9 +97,15 @@ def make_atari_env(
                 gym.wrappers, "FrameStack", None
             )
             env = stack(env, frame_stack)
+        if frame_stack == 1:
+            if grayscale:
+                env = gym.wrappers.ReshapeObservation(env, (1, screen_size, screen_size))
+            else:
+                from common.env.wrappers import ChannelsFirstWrapper
+                env = ChannelsFirstWrapper(env)
         return env
 
-    return vectorize(_one, num_envs, seed, async_envs)
+    return vectorize(_one, num_envs, seed, async_envs, autoreset_mode)
 
 
 def make_atari_envpool(

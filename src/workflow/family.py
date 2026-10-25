@@ -40,8 +40,8 @@ def parse_family(data, path):
         raise ValueError(f'unknown family configuration keys: {sorted(set(data) - TOP)}')
     if data.get('version') != 2:
         raise ValueError('family configuration requires version: 2')
-    if data.get('family') not in ('minatar', 'mujoco', 'classic_control'):
-        raise ValueError('family must be minatar, mujoco or classic_control')
+    if data.get('family') not in ('minatar', 'mujoco', 'classic_control', 'atari', 'dmcontrol', 'minigrid', 'craftax', 'box2d', 'toy_text'):
+        raise ValueError('unknown environment family')
     algos = data.get('algo')
     algos = [algos] if isinstance(algos, str) else algos
     envs = data.get('envs')
@@ -98,7 +98,21 @@ def compile_family(exp):
                 for key, value in zip(sweep, values):
                     head, tail = key.split('.', 1)
                     _set_by_path(config, SECTIONS[head] + '.' + tail, value)
-                params = config.setdefault('env_params', {})
+                from architecture.backbones import resolve_normalization, validate_backbone
+                network = config.setdefault('network_params', {})
+                if algo == 'dppo':
+                    if network.get('action_head','auto') == 'auto':network['action_head']='diffusion'
+                    if network['action_head'] != 'diffusion':raise ValueError('dppo requires model.action_head=diffusion')
+                    # Validate unsupported entropy/objective settings in --plan too.
+                    entry.config_cls(**config.get('algo_params', {}))
+                elif network.get('action_head') == 'diffusion':
+                    raise ValueError('Diffusion action heads require algo=dppo; PPO/GA2E marginal log_prob is unavailable')
+                validate_backbone(PolicyConfig(**network))
+                config['env_params'] = resolve_normalization(network, config.get('env_params', {}))
+                params = config['env_params']
+                if 'wrappers' in params:
+                    from common.env.transforms import validate_transforms
+                    params['wrappers'] = validate_transforms(params['wrappers'])
                 if spec['family'] == 'minatar':
                     params['sticky_action_prob'] = sticky_probability(params.get('sticky_action_prob', .1))
                 elif 'sticky_action_prob' in params:
@@ -111,6 +125,8 @@ def compile_family(exp):
                         raise ValueError(f'{algo}/{env}/{section}: unknown parameters {sorted(unknown)}')
                 # One group per algorithm/configuration; seeds share a group hash.
                 group_config = {'base': base, 'environments': environments, 'sweep': dict(zip(sweep, values))}
+                if hasattr(entry.config_cls, 'parity_version'):
+                    group_config['algorithm_version'] = entry.config_cls.parity_version
                 group = algo + '-' + _identity(algo, '', 0, group_config)
                 for seed in range(exp.runs):
                     identity = _identity(algo, env, seed, config)

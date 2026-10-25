@@ -5,6 +5,7 @@ import argparse
 def main():
     p=argparse.ArgumentParser(description='OnPolicyRL native experiment runner')
     p.add_argument('config',nargs='?')
+    p.add_argument('--set', action='append', default=[], metavar='PATH=VALUE', help='Override local family config (YAML value); repeatable')
     p.add_argument('--list',action='store_true')
     p.add_argument('--device')
     p.add_argument('--plan', action='store_true', help='Validate and print resolved jobs without training')
@@ -20,6 +21,9 @@ def main():
         from workflow.registry import list_algorithms
         print(' '.join(list_algorithms()));return
     if not a.config:p.error('experiment config required')
+    if a.set:
+        from workflow.overrides import materialize
+        a.config=materialize(a.config,a.set)
     if a.plan:
         if a.commit:
             p.error('--plan inspects current code; use --commit --prepare-only to prepare pinned code')

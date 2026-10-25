@@ -55,7 +55,7 @@ def read_metrics(path: str | Path) -> list[dict]:
 # still flat. `_lookup` reads a flat, prefixed key from either layout.
 _BUCKET = {
     "train/": "train", "loss/": "train", "grad/": "train",
-    "diag/": "train", "time/": "train", "perf/": "train",
+    "train/": "train", "time/": "train", "perf/": "train",
     "rollout/": "rollout", "charts/": "rollout",
     "eval/": "eval",
 }

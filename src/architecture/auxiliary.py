@@ -21,6 +21,7 @@ class RelativeValuePolicy(ActorCritic):
         return self.relative_head(a-b).squeeze(-1)
 
 def build_special(obs_space, act_space, network, algo, kind):
+    if network.action_head == 'diffusion':raise ValueError('Diffusion requires dppo, not an auxiliary Gaussian/categorical policy')
     if kind=='dae' and type(act_space).__name__!='Discrete':
         raise ValueError('DAE requires discrete actions')
     base=build_policy(obs_space,act_space,network)
@@ -41,7 +42,7 @@ def build_special(obs_space, act_space, network, algo, kind):
             policy.value_head=nn.Identity()
     else: policy=base
     if kind=='ga2e':
-        policy.register_buffer('lambda_ema',th.tensor(0.0))
+        policy.register_buffer('lambda_ema',th.tensor(0.0,dtype=th.float64))
         policy.register_buffer('lambda_initialized',th.tensor(False))
     if kind=='vmpo':
         policy.duals=nn.Parameter(th.ones(3))

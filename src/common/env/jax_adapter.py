@@ -20,15 +20,17 @@ class _StickyState(NamedTuple):
 
 
 @lru_cache(maxsize=32)
-def _minatar_kernel(name, minimal, limit, sticky):
+def _minatar_kernel(name, minimal, limit, sticky, ramping=True):
     import gymnax
     import jax
     import jax.numpy as jp
     env, params = gymnax.make(name, use_minimal_action_set=minimal)
     params = params.replace(max_steps_in_episode=limit)
+    if hasattr(params, "ramping"): params = params.replace(ramping=ramping)
 
     def reset(key):
         obs, state = env.reset(key, params)
+        if hasattr(state, "ramping"): state = state.replace(ramping=jp.asarray(ramping))
         return obs, _StickyState(state, jp.array(0, dtype=jp.int32))
 
     def raw_step(key, state, action):
@@ -65,10 +67,10 @@ def _mjx_kernel(name, options):
 
 
 @lru_cache(maxsize=64)
-def _batch_kernels(kind, name, minimal, limit, options, sticky):
+def _batch_kernels(kind, name, minimal, limit, options, sticky, ramping=True):
     import jax
     import jax.numpy as jp
-    reset, step, obs_space, action_space = (_minatar_kernel(name, minimal, limit, sticky)
+    reset, step, obs_space, action_space = (_minatar_kernel(name, minimal, limit, sticky, ramping)
         if kind == 'minatar' else _mjx_kernel(name, options))
 
     def one(key, state, action, ep_return, ep_length):
@@ -104,6 +106,8 @@ class JaxVectorAdapter:
         if env_id.startswith('MinAtar/'):
             kind = 'minatar'
             sticky = sticky_probability(task_options.pop('sticky_action_prob', 0.1))
+            ramping = task_options.pop('difficulty_ramping', True)
+            if type(ramping) is not bool: raise ValueError('difficulty_ramping must be boolean')
             game = env_id.split('/')[1].split('-')[0]
             name = game + '-MinAtar'
             if game not in ('Asterix', 'Breakout', 'Freeway', 'Seaquest', 'SpaceInvaders'):
@@ -114,6 +118,7 @@ class JaxVectorAdapter:
         elif env_id.startswith('MJX/'):
             kind, name, limit = 'mjx', env_id.split('/', 1)[1], 1000
             sticky = None
+            ramping = True
             if 'sticky_action_prob' in task_options:
                 raise ValueError('sticky_action_prob is a MinAtar-only option')
         else:
@@ -126,13 +131,14 @@ class JaxVectorAdapter:
         self.jax_device = jax.devices(jax_platform)[jax_device_index]
         with jax.default_device(self.jax_device):
             self._reset, self._step, self.obs_space, self.action_space = _batch_kernels(
-                kind, name, bool(use_minimal_action_set), limit, tuple(sorted(task_options.items())), sticky)
+                kind, name, bool(use_minimal_action_set), limit, tuple(sorted(task_options.items())), sticky, ramping)
         self._state = None
         self.provenance = dict(backend='gymnax' if kind=='minatar' else 'brax-mjx',
                                task=name, jax_platform=self.jax_device.platform,
                                max_episode_steps=limit, minimal_actions=bool(use_minimal_action_set))
         if kind == 'minatar':
             self.provenance['sticky_action_prob'] = sticky
+            self.provenance['difficulty_ramping'] = ramping
 
     def _tensor(self, value):
         # DLPack transfers ownership correctly and avoids a numpy host roundtrip

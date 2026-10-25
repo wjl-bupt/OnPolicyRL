@@ -1,16 +1,16 @@
-# One environment family; select algorithms and environments here.
+# Backend-specific experiment; algorithms and environments share this file.
 version: 2
 family: mujoco
 algo: ppo
 envs:
-- MJX/inverted_pendulum
+- InvertedPendulum-v5
 runs: 1
 resume: false
 train:
   num_envs: 8
-  rollout_len: 32
+  rollout_len: 256
   num_mini_batch: 4
-  ppo_epoch: 2
+  ppo_epoch: 10
   total_steps: 512
   device: cuda:0
   gae_lambda: 0.95
@@ -21,9 +21,15 @@ model:
   - 64
   lr: 0.0003
 environment:
-  backend: jax
-  jax_platform: cpu
+  backend: gymnasium
   max_episode_steps: 100
+  implementation: gymnasium
+  wrappers:
+    normalize_observation: true
+    observation_clip: 10.0
+    normalize_reward: false
+    action_mode: rescale
+  autoreset_mode: SameStep
 evaluation:
   eval_num_envs: 2
   eval_episodes: 2

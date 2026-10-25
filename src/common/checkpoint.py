@@ -40,7 +40,7 @@ import torch as th
 
 
 def save_checkpoint(path: str | Path, policy, *, global_step: int,
-                    iteration: int, meta: dict | None = None) -> None:
+                    iteration: int, meta: dict | None = None, env_state: dict | None = None) -> None:
     """Atomically write a checkpoint for ``policy`` at ``path``.
 
     ``policy`` must expose ``state_dict()`` and an ``optimizer`` attribute (the
@@ -52,6 +52,7 @@ def save_checkpoint(path: str | Path, policy, *, global_step: int,
     opt = getattr(policy, "optimizer", None)
     payload: dict[str, Any] = {
         "policy": policy.state_dict(),
+        "env_state": env_state,
         "optimizer": opt.state_dict() if opt is not None else None,
         "python_rng": random.getstate(),
         "numpy_rng": np.random.get_state(),
@@ -91,7 +92,7 @@ def load_checkpoint(path: str | Path, policy, *,
         th.set_rng_state(rng.to("cpu", th.uint8))
     return {"global_step": int(ckpt.get("global_step", 0)),
             "iteration": int(ckpt.get("iteration", 0)),
-            "meta": ckpt.get("meta", {})}
+            "meta": ckpt.get("meta", {}), "env_state": ckpt.get("env_state")}
 
 
 def peek_checkpoint(path: str | Path,
@@ -102,7 +103,7 @@ def peek_checkpoint(path: str | Path,
     ckpt = th.load(path, map_location=map_location, weights_only=False)
     return {"global_step": int(ckpt.get("global_step", 0)),
             "iteration": int(ckpt.get("iteration", 0)),
-            "meta": ckpt.get("meta", {})}
+            "meta": ckpt.get("meta", {}), "env_state": ckpt.get("env_state")}
 
 
 def fingerprint(algo_config: dict, hardware: dict) -> str:

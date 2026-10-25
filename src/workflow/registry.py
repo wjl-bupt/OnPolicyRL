@@ -6,6 +6,7 @@ from typing import Callable
 
 
 def _default_policy(obs, action, network, algo):
+    if getattr(network,'action_head','auto') == 'diffusion':raise ValueError('Diffusion requires the dppo algorithm')
     from architecture.actor_critic import build_policy
     return build_policy(obs, action, network)
 

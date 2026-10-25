@@ -41,6 +41,26 @@ class PolicyConfig:
     """Network-axis knobs (S0). Structure is code (heads/encoder); these are the
     hyperparameters the assembler reads."""
 
+    architecture: str = "mlp"  # mlp | simba | bronet | spectralnet
+    action_head: str = "auto"  # auto categorical/Gaussian, or diffusion (DPPO)
+    context_length: int = 16
+    attention_heads: int = 4
+    transformer_gated: bool = True
+    diffusion_steps: int = 10
+    diffusion_hidden_dim: int = 256
+    diffusion_blocks: int = 2
+    diffusion_time_dim: int = 32
+    diffusion_min_std: float = 0.1
+    diffusion_clip_denoised: float = 1.0
+    hidden_dim: int = 256
+    num_blocks: int = 2
+    actor_hidden_dim: int | None = None
+    critic_hidden_dim: int | None = None
+    actor_num_blocks: int | None = None
+    critic_num_blocks: int | None = None
+    expansion: int = 4
+    norm_eps: float = 1e-6
+    rsnorm: bool | None = None  # auto: enabled for SimBa by family compiler
     net_arch: tuple[int, ...] = (64, 64)     # MLP hidden widths (vector obs)
     activation: type[nn.Module] = nn.Tanh    # MLP activation; CNN always uses ReLU
     share: bool = False                      # separate actor/critic (default); images force shared
@@ -176,12 +196,25 @@ def _obs_shape(space) -> tuple[int, ...]:
     return tuple(space.shape) if getattr(space, "shape", None) is not None else ()
 
 
-def build_policy(obs_space, act_space, cfg: PolicyConfig | None = None) -> ActorCritic:
+# architecture/policy.py 里加一个，或者放你新建的 my_policy.py
+def policy_impl(cls) -> ActorCritic:
+    """Legacy registration; build_policy selects custom policy_cls explicitly."""
+    global _POLICY_CLS
+    if not callable(cls):
+        raise TypeError(f"policy class must be callable, got {cls!r}")
+    _POLICY_CLS = cls
+    return cls
+
+_POLICY_CLS: type = ActorCritic  
+
+def build_policy(obs_space, act_space, cfg: PolicyConfig | None = None, *, policy_cls=None) -> ActorCritic:
     """Assemble the S0 network from the spaces. Duck-typed: any object with the
     right `.shape` / `.n` works, so this never imports gymnasium (mirrors
     protocol.buffer.base_schema). Swapping encoder or head happens here -- no PPO
     or algorithm edit."""
     cfg = cfg or PolicyConfig()
+    from architecture.backbones import ResidualExtractor, validate_backbone
+    validate_backbone(cfg)
     obs_shape = _obs_shape(obs_space)
     if type(obs_space).__name__ == "Dict":
         raise NotImplementedError(
@@ -190,9 +223,23 @@ def build_policy(obs_space, act_space, cfg: PolicyConfig | None = None) -> Actor
             "the text `mission` leaf; vector and image obs are wired, dict is not."
         )
     is_image = len(obs_shape) == 3
-    share = cfg.share or is_image            # images always share the conv trunk
+    share = cfg.share or (is_image and cfg.architecture != 'causal_transformer')            # images always share the conv trunk
 
-    def make_extractor() -> nn.Module:
+    def residual(in_dim, branch):
+        return ResidualExtractor(in_dim, cfg.architecture,
+            getattr(cfg, branch + '_hidden_dim') or cfg.hidden_dim,
+            getattr(cfg, branch + '_num_blocks') or cfg.num_blocks,
+            cfg.expansion, cfg.norm_eps)
+
+    if share and (not is_image or cfg.architecture == 'causal_transformer') and cfg.architecture != 'mlp':
+        if ((cfg.actor_hidden_dim or cfg.hidden_dim) != (cfg.critic_hidden_dim or cfg.hidden_dim)
+            or (cfg.actor_num_blocks or cfg.num_blocks) != (cfg.critic_num_blocks or cfg.num_blocks)):
+            raise ValueError('Shared vector backbone requires identical actor/critic dimensions and blocks')
+
+    def make_extractor(branch='actor') -> nn.Module:
+        if cfg.architecture == 'causal_transformer':
+            from architecture.causal import CausalExtractor
+            return CausalExtractor(obs_shape, obs_space.dtype, cfg, branch)
         if is_image:
             scale = 255.0 if np.dtype(obs_space.dtype) == np.uint8 else 1.0
             specs = (ImageExtractor.NATURE if min(obs_shape[1], obs_shape[2]) >= 36
@@ -206,27 +253,34 @@ def build_policy(obs_space, act_space, cfg: PolicyConfig | None = None) -> Actor
         if len(obs_shape) != 1:
             raise NotImplementedError(
                 f"obs shape {obs_shape} is neither vector (1-D) nor image (3-D)")
+        if cfg.architecture != 'mlp':
+            return residual(obs_shape[0], branch)
         return MlpExtractor(obs_shape[0], cfg.net_arch, cfg.activation, cfg.ortho_init)
 
     if share:
         extractors: object = make_extractor()
         feat_dim = extractors.out_dim
     else:
-        pi_ex, vf_ex = make_extractor(), make_extractor()
+        pi_ex, vf_ex = make_extractor('actor'), make_extractor('critic')
         extractors = (pi_ex, vf_ex)
         feat_dim = pi_ex.out_dim
 
+    pi_dim = feat_dim
+    vf_dim = feat_dim if share else vf_ex.out_dim
     post = None
-    if is_image and cfg.image_net_arch:
+    if is_image and cfg.architecture in ('simba','bronet','spectralnet'):
+        post = (residual(feat_dim, 'actor'), residual(feat_dim, 'critic'))
+        pi_dim, vf_dim = post[0].out_dim, post[1].out_dim
+    if is_image and cfg.image_net_arch and cfg.architecture == 'mlp':
         post = (MlpExtractor(feat_dim, cfg.image_net_arch, cfg.activation, cfg.ortho_init),
                 MlpExtractor(feat_dim, cfg.image_net_arch, cfg.activation, cfg.ortho_init))
-        feat_dim = post[0].out_dim
+        pi_dim = vf_dim = post[0].out_dim
 
     aname = type(act_space).__name__
     if aname == "Discrete":
-        head: nn.Module = CategoricalHead(feat_dim, int(act_space.n), cfg.ortho_init)
+        head: nn.Module = CategoricalHead(pi_dim, int(act_space.n), cfg.ortho_init)
     elif aname == "Box":
-        head = DiagGaussianHead(feat_dim, int(np.prod(act_space.shape)),
+        head = DiagGaussianHead(pi_dim, int(np.prod(act_space.shape)),
                                 cfg.log_std_init, cfg.ortho_init)
     else:
         raise NotImplementedError(
@@ -234,12 +288,21 @@ def build_policy(obs_space, act_space, cfg: PolicyConfig | None = None) -> Actor
             f"MultiDiscrete / MultiBinary head belongs here."
         )
 
-    value_head = nn.Linear(feat_dim, 1)
+    value_head = nn.Linear(vf_dim, 1)
     if cfg.ortho_init:
         layer_init(value_head, gain=1.0)
 
-    policy = ActorCritic(extractors, head, value_head, share)
+    # Algorithm-specific policy classes must not leak through module imports.
+    policy = (ActorCritic(extractors, head, value_head, share) if policy_cls is None
+              else policy_cls(extractors, head, value_head, share, cfg))
     if post is not None:
         policy.pi_post, policy.vf_post = post
+    if cfg.action_head == 'diffusion':
+        if aname != 'Box' or len(act_space.shape) != 1:
+            raise ValueError('Diffusion requires a flat continuous Box action space')
+        if not (np.allclose(act_space.low,-1.) and np.allclose(act_space.high,1.)):
+            raise ValueError('Diffusion expects normalized [-1,1] actions; use action_mode=rescale')
+        from architecture.diffusion import DiffusionPolicy
+        policy = DiffusionPolicy(policy, pi_dim, int(np.prod(act_space.shape)), cfg)
     policy.optimizer = cfg.optimizer_cls(policy.parameters(), lr=cfg.lr, eps=cfg.adam_eps)
     return policy

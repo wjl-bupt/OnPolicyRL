@@ -1,0 +1,65 @@
+# Backend-specific experiment; algorithms and environments share this file.
+version: 2
+family: minatar
+algo:
+- ppo
+- ga2e
+envs:
+- MinAtar/Asterix-v0
+- MinAtar/Breakout-v0
+- MinAtar/Freeway-v0
+- MinAtar/Seaquest-v0
+- MinAtar/SpaceInvaders-v0
+runs: 5
+resume: true
+train:
+  num_envs: 512
+  rollout_len: 128
+  num_mini_batch: 256
+  ppo_epoch: 6
+  total_steps: 10000000
+  log_interval: 1
+  device: cuda:0
+  gamma: 0.99
+  epsilon: 0.1
+  clip_schedule: linear
+  clip_range_min: 0.0
+  ent_coef: 0.01
+  vf_coef: 0.5
+  value_loss_scale: 1.0
+  anneal_lr: true
+  lr_min: 0.0
+model:
+  image_encoder: minatar_reference
+  features_dim: 256
+  image_net_arch:
+  - 64
+  - 64
+  lr: 0.00025
+environment:
+  use_minimal_action_set: false
+  max_episode_steps: 500000
+  autoreset_mode: SameStep
+  backend: gymnasium
+  sticky_action_prob: 0.1
+  difficulty_ramping: true
+  implementation: gymnasium
+  wrappers: {}
+evaluation:
+  eval_interval: 10
+  eval_episodes: 100
+  ckpt_count: 5
+  eval_num_envs: 20
+algorithms:
+  ppo:
+    train:
+      gae_lambda: 0.95
+  ga2e:
+    train:
+      lambda_val: 0.99
+      lambda_refresh: epoch
+      grad_chunk_size: 2048
+environments:
+  MinAtar/Freeway-v0:
+    environment:
+      max_episode_steps: 2500

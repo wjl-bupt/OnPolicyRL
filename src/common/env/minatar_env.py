@@ -66,6 +66,7 @@ def make_minatar_env(
     seed: int | None = None,
     *,
     channels_first: bool = True,
+    float_observation: bool = False,
     frame_stack: int = 1,
     autoreset_mode: str | None = None,
     async_envs: bool = False,
@@ -89,6 +90,9 @@ def make_minatar_env(
                 gym.wrappers, "FrameStack", None
             )
             env = stack(env, frame_stack)
+        if float_observation:
+            from common.env.observations import FloatObservation
+            env = FloatObservation(env)
         return env
 
     return vectorize(_one, num_envs, seed, async_envs, autoreset_mode)

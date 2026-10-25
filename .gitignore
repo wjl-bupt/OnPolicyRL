@@ -29,3 +29,4 @@ runs/
 # Isolated revision cache and JAX runtime
 .oprl/
 .venv-jax/
+scripts/run_debugger.sh

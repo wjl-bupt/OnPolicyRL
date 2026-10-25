@@ -27,7 +27,7 @@ _FAMILIES: list[tuple[str, re.Pattern]] = [
         r"^(HalfCheetah|Ant|Walker2d|Hopper|Humanoid|Swimmer|Reacher|"
         r"InvertedPendulum|InvertedDoublePendulum|Pusher)")),
     ("classic", re.compile(
-        r"^(CartPole|Acrobot|Pendulum|MountainCar|LunarLander|BipedalWalker)")),
+        r"^(CartPole|Acrobot|Pendulum|MountainCar|LunarLander|BipedalWalker|CarRacing|FrozenLake|Taxi|CliffWalking|Blackjack)")),
 ]
 
 _ENVPOOL_FAMILIES = {"atari", "minigrid"}

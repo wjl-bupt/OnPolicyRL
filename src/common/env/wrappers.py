@@ -25,7 +25,10 @@ class FireResetWrapper(gym.Wrapper):
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        obs, _, terminated, truncated, info = self.env.step(1)  # 1 = FIRE in the ALE set
+        meanings = self.env.unwrapped.get_action_meanings()
+        if 'FIRE' not in meanings:
+            return obs, info
+        obs, _, terminated, truncated, info = self.env.step(meanings.index('FIRE'))
         if terminated or truncated:
             obs, info = self.env.reset(**kwargs)
         return obs, info

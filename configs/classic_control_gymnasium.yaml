@@ -1,4 +1,4 @@
-# One environment family; select algorithms and environments here.
+# Backend-specific experiment; algorithms and environments share this file.
 version: 2
 family: classic_control
 algo: ppo
@@ -27,3 +27,10 @@ sweep:
   train.epsilon:
   - 0.1
   - 0.2
+environment:
+  implementation: gymnasium
+  max_episode_steps: 500
+  wrappers:
+    action_mode: clip
+  backend: gymnasium
+  autoreset_mode: SameStep

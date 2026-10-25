@@ -19,6 +19,7 @@ def make_classic_env(
     num_envs: int = 1,
     seed: int | None = None,
     *,
+    autoreset_mode: str | None = None,
     async_envs: bool = False,
     use_default_wrappers: bool = True,
     **gym_make_kwargs,
@@ -29,9 +30,15 @@ def make_classic_env(
         env = gym.make(env_id, **gym_make_kwargs)
         if not use_default_wrappers:
             return env
+        if isinstance(env.observation_space, gym.spaces.Discrete):
+            from common.env.observations import OneHotObservation
+            env = OneHotObservation(env)
+        if len(getattr(env.observation_space, 'shape', ())) == 3:
+            from common.env.wrappers import ChannelsFirstWrapper
+            env = ChannelsFirstWrapper(env)
         return gym.wrappers.RecordEpisodeStatistics(env)
 
-    return vectorize(_one, num_envs, seed, async_envs)
+    return vectorize(_one, num_envs, seed, async_envs, autoreset_mode)
 
 
 if __name__ == "__main__":

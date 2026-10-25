@@ -150,7 +150,7 @@ class JsonlSink:
 # --------------------------------------------------------------------------- #
 
 _AGG = {
-    "train/": "mean", "loss/": "mean", "grad/": "mean", "diag/": "mean",
+    "train/": "mean", "loss/": "mean", "grad/": "mean", "train/": "mean",
     "time/": "sum", "perf/": "last", "eval/": "last",
     "rollout/": "window", "charts/": "window",
 }
@@ -168,13 +168,13 @@ def _agg_for(key: str) -> str:
 # --------------------------------------------------------------------------- #
 
 # Three buckets by author request: everything produced during optimization
-# (train/loss/grad/diag/time/perf) is "train"; the rollout sliding-window stats
+# (train/loss/grad/train/time/perf) is "train"; the rollout sliding-window stats
 # (rollout/charts) are "rollout"; deterministic evaluation is "eval". This drives
 # ONLY how JsonlSink lays a record out on disk -- aggregation (_AGG), the console
 # table and history() all keep the flat, prefixed keys.
 _CATEGORY = {
     "train/": "train", "loss/": "train", "grad/": "train",
-    "diag/": "train", "time/": "train", "perf/": "train",
+    "train/": "train", "time/": "train", "perf/": "train",
     "rollout/": "rollout", "charts/": "rollout",
     "eval/": "eval",
 }
@@ -512,7 +512,7 @@ if __name__ == "__main__":
         for i in range(5):
             log.record("loss/policy", -0.1 - i)   # mean-aggregated
         log.record("loss/policy", -0.14)          # ...plus one more observation
-        log.record("diag/kl", 0.009)
+        log.record("train/kl", 0.009)
         log.record("perf/sps", 1234.5)
         log.record("time/env", 0.7)
         log.record("time/fwd", 0.3)
@@ -522,8 +522,8 @@ if __name__ == "__main__":
 
         log.event("kl_explode", iteration=96, global_step=2048, value=0.42,
                   threshold=0.2)
-        assert len(log.history("diag/kl")) == 1
-        assert abs(log.history("diag/kl")[0] - 0.009) < 1e-9
+        assert len(log.history("train/kl")) == 1
+        assert abs(log.history("train/kl")[0] - 0.009) < 1e-9
         log.dump(step=4096)   # window keys re-emitted, acc keys gone
         log.close()
 
@@ -531,7 +531,7 @@ if __name__ == "__main__":
                  open(Path(td) / "metrics.jsonl", encoding="utf-8")]
         # records are grouped into train/rollout/eval buckets, leaf-named
         assert lines[0]["step"] == 2048
-        assert abs(lines[0]["train"]["kl"] - 0.009) < 1e-9         # was diag/kl
+        assert abs(lines[0]["train"]["kl"] - 0.009) < 1e-9         # was train/kl
         assert abs(lines[0]["eval"]["ep_rew_mean"] - 187.3) < 1e-9
         assert abs(lines[0]["rollout"]["ep_rew_mean"] - 199.5) < 1e-9
         assert "train" not in lines[1], "acc keys must clear after dump"

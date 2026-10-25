@@ -328,7 +328,7 @@ class PPO:
             # critic health -- an underrated diagnostic (metrics.py)
             if stats:
                 buf = self.rollout_buffer
-                self.log.record("diag/explained_variance",
+                self.log.record("train/explained_variance",
                                 explained_variance(buf.values, buf.returns))
             self.log.record("perf/sps", self._sps_and_drain())
             self.log.record("train/updates", self.num_updates)

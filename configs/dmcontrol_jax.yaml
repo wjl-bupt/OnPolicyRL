@@ -1,0 +1,35 @@
+# Backend-specific experiment; algorithms and environments share this file.
+version: 2
+algo: ppo
+runs: 1
+resume: false
+train:
+  total_steps: 1024
+  num_envs: 2
+  rollout_len: 32
+  num_mini_batch: 2
+  ppo_epoch: 2
+  gae_lambda: 0.95
+  device: cpu
+model:
+  net_arch:
+  - 64
+  - 64
+  lr: 0.0003
+evaluation:
+  eval_interval: 0
+  eval_episodes: 2
+  eval_num_envs: 2
+  ckpt_count: 1
+envs:
+- Playground/CartpoleBalance
+environment:
+  implementation: playground-mjx
+  max_episode_steps: 1000
+  action_repeat: 1
+  wrappers:
+    action_mode: rescale
+  backend: jax
+  autoreset_mode: SameStep
+  jax_platform: cpu
+family: dmcontrol

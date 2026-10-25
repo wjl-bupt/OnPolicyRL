@@ -44,6 +44,9 @@ def make_minigrid_env(
     seed: int | None = None,
     *,
     obs_mode: str = "dict",
+    view_size: int = 7,
+    fully_observable: bool = False,
+    autoreset_mode: str | None = None,
     async_envs: bool = False,
     use_default_wrappers: bool = True,
     **gym_make_kwargs,
@@ -58,16 +61,25 @@ def make_minigrid_env(
         env = gym.make(env_id, **gym_make_kwargs)
         if not use_default_wrappers:
             return env
+        from minigrid.wrappers import ViewSizeWrapper, FullyObsWrapper
+        if view_size != 7: env = ViewSizeWrapper(env, agent_view_size=view_size)
+        if fully_observable: env = FullyObsWrapper(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if obs_mode == "flat":
             from minigrid.wrappers import FlatObsWrapper
 
             env = FlatObsWrapper(env)
+        elif obs_mode in ('symbolic', 'pixels'):
+            from common.env.observations import MiniGridEncoding
+            if obs_mode == 'pixels':
+                from minigrid.wrappers import RGBImgPartialObsWrapper
+                env = RGBImgPartialObsWrapper(env)
+            env = MiniGridEncoding(env, obs_mode)
         elif obs_mode != "dict":
             raise ValueError(f"obs_mode must be 'dict' or 'flat', got {obs_mode!r}")
         return env
 
-    return vectorize(_one, num_envs, seed, async_envs)
+    return vectorize(_one, num_envs, seed, async_envs, autoreset_mode)
 
 
 def make_minigrid_envpool(

@@ -1,4 +1,4 @@
-# One environment family; select algorithms and environments here.
+# Backend-specific experiment; algorithms and environments share this file.
 version: 2
 family: minatar
 algo:
@@ -43,6 +43,9 @@ environment:
   backend: jax
   jax_platform: cpu
   sticky_action_prob: 0.1
+  difficulty_ramping: true
+  implementation: gymnax
+  wrappers: {}
 evaluation:
   eval_interval: 10
   eval_episodes: 100

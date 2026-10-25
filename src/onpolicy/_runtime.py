@@ -25,19 +25,27 @@ def estimates(buf, gamma, lam, values=None, next_values=None):
     return adv.detach(), (adv + values).detach()
 
 
-def make_buffer(cfg, env):
+def make_buffer(cfg, env, *, extra_schema=None, extra_samples=()):
     if cfg.num_envs != env.num_envs:
         raise ValueError("num_envs must match the environment adapter")
     schema = base_schema(env.obs_space, env.action_space)
     if 'obs' not in schema:
         raise NotImplementedError('Native algorithms currently require numeric vector/image observations')
     schema.update(next_obs=Field(schema['obs'].shape, schema['obs'].dtype), next_value=Field())
+    if extra_schema:
+        if schema.keys() & extra_schema.keys():raise ValueError('Extra schema must not replace core fields')
+        schema.update(extra_schema)
     return RolloutBuffer(cfg.rollout_len, cfg.num_envs, schema, cfg.device,
-                         MinibatchSpec(num_minibatches=cfg.num_mini_batch))
+                         MinibatchSpec(num_minibatches=cfg.num_mini_batch),
+                         extra_samples=extra_samples)
 
 
 class NativeLoop(PPO):
     """Shared native lifecycle, with algorithm-specific estimation and update methods."""
+    def _sample_policy(self,obs):
+        action,logp,value=self.policy.act(obs)
+        return action,logp,value,{}
+
     @th.no_grad()
     def _collect_rollout_(self):
         buf = self.rollout_buffer
@@ -45,9 +53,9 @@ class NativeLoop(PPO):
         if self._last_obs is None: self._last_obs = self.env.reset(seed=self.config.seed)
         for _ in range(buf.T):
             with self.timer('fwd'):
-                actions, logp, values = self.policy.act(self._last_obs)
+                actions, logp, values, extras = self._sample_policy(self._last_obs)
             buf.write_obs(self._last_obs)
-            buf.write(action=actions, logprob=logp, value=values)
+            buf.write(action=actions, logprob=logp, value=values, **extras)
             with self.timer('env'):
                 obs, reward, masks, info = self.env.step(actions)
             successor = info.get('_transition_obs', obs)
@@ -90,6 +98,8 @@ class NativeLoop(PPO):
 
 
 def run_algorithm(cls, cfg, env, policy, log=None, monitor=None, resume=None):
+    if getattr(policy, 'requires_denoising_chain', False):
+        raise ValueError('Diffusion policies require dppo and a denoising-chain buffer')
     algo = cls(env, policy, make_buffer(cfg,env),cfg,log=log,monitor=monitor)
     if resume:
         algo.global_step = int(resume['global_step'])

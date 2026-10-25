@@ -49,7 +49,7 @@ def explained_variance(y_pred: torch.Tensor, y_true: torch.Tensor) -> float:
 
     <= 0 means the critic explains none of the return variance -- i.e. it is not
     learning. An underrated diagnostic; the training loop should record it into
-    `diag/explained_variance` every iteration.
+    `train/explained_variance` every iteration.
     """
     var_y = y_true.var()
     if var_y == 0:

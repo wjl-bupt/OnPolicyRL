@@ -150,8 +150,13 @@ class JsonlSink:
 # --------------------------------------------------------------------------- #
 
 _AGG = {
+    "review_search/search_calls": "sum", "review_search/gradient_evaluations": "sum",
+    "review_search/extra_used_gradient_evaluations": "sum", "review_reference/extra_gradient_evaluations": "sum",
+    "review/optimizer_steps": "sum", "review/epochs_entered": "sum",
+    "review/early_stop": "sum", "review/actor_early_stop": "sum",
     "train/": "mean", "loss/": "mean", "grad/": "mean", "train/": "mean",
     "time/": "sum", "perf/": "last", "eval/": "last",
+    "review_time/": "sum", "review_candidates/": "last", "review_lambda/": "last",
     "rollout/": "window", "charts/": "window",
 }
 

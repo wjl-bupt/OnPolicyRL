@@ -9,12 +9,14 @@
 - 框架开发者：[架构与协议](architecture.md) → [扩展开发](development.md)。
 - 遇到问题：[排查指南](troubleshooting.md)。
 - GA2E 移植核验：[原仓库一致性审计](ga2e_parity.md)。
+- AAE / PAE：[参数、实现约定与验证](advantage_estimators.md)。
+- APO / GA2E 诊断指标、离散动作与 actor 数据开关：[审稿补充实现](review_extensions.md)。
 
 ## 当前能力与边界
 
 | 维度 | 当前实现 |
 |---|---|
-| 算法 | PPO、GA2E、SPO、RVL、DAE、V-MPO、DPPO；原生 PyTorch |
+| 算法 | PPO、GA2E、AAE、PAE、APO、SPO、RVL、DAE、V-MPO、DPPO；原生 PyTorch |
 | 网络 | MLP/CNN、SimBa、BroNet、SpectralNet、固定窗口因果 Transformer |
 | 动作头 | 离散分类、连续对角高斯；连续动作 DDPM + DPPO |
 | 环境 | Gymnasium 与 JAX 分开配置，公共 tensor wrapper；具体后端见环境页 |

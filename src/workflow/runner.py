@@ -93,6 +93,11 @@ def _dump_config(path: Path, job: Job, cfg, device: str) -> None:
         "config": job.config,
         "algo_config": asdict(cfg) if is_dataclass(cfg) else str(cfg),
     }
+    # Record working-source contents, including uncommitted implementation edits.
+    import hashlib
+    source_root=Path(__file__).resolve().parents[1]
+    resolved['source_fingerprint']={p.relative_to(source_root).as_posix():hashlib.sha256(p.read_bytes()).hexdigest()
+                                    for p in sorted(source_root.rglob('*.py')) if '__pycache__' not in p.parts}
     try:
         path.write_text(json.dumps(resolved, indent=2, default=str), encoding="utf-8")
     except Exception:  # noqa: BLE001

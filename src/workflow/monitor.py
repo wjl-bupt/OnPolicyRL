@@ -29,6 +29,8 @@ primitives) so the orchestration is testable without a live env.
 from __future__ import annotations
 
 import math
+import time
+import json
 from pathlib import Path
 from typing import Callable
 
@@ -43,6 +45,7 @@ class Monitor:
                  ckpt_count: int = 3, ckpt_interval: int = 20, eval_seed: int = 0,
                  kl_threshold: float = 0.5, meta: dict | None = None,
                  eval_fn: Callable = evaluate, save_fn: Callable = save_checkpoint):
+        self._session_clock=time.perf_counter();self._session_step=0
         self.policy = policy
         self.env_factory = env_factory
         self.log = log
@@ -135,18 +138,33 @@ class Monitor:
     # --------------------------- eval / checkpoint ----------------------- #
 
     def _safe_eval(self, gs: int, it: int) -> None:
+        start=time.perf_counter()
         try:
             metrics = self._eval_fn(self.policy, self.env_factory,
-                                    episodes=self.eval_episodes, seed=self.eval_seed)
+                                    episodes=self.eval_episodes, seed=self.eval_seed,
+                                    **({'return_details':True} if self._eval_fn is evaluate else {}))
+            details=metrics.pop('_episode_details',None)
+            wall=time.perf_counter()-self._session_clock
+            metrics['eval/session_wall_seconds']=wall
+            metrics['eval/session_steps']=gs-self._session_step
+            if details is not None:
+                self.run_dir.mkdir(parents=True,exist_ok=True)
+                with (self.run_dir/'evaluation_episodes.jsonl').open('a') as f:
+                    f.write(json.dumps(dict(step=gs,iteration=it,seed=self.eval_seed,session_wall_seconds=wall,
+                         reward_source='raw_episode_return',deterministic=True,**details))+'\n')
             for k, v in metrics.items():
                 self.log.record(k, v)         # eval/* -> "last" agg, flushed next dump
         except Exception as e:  # noqa: BLE001 -- an eval must never kill training
             self.log.event("eval_failed", iteration=it, global_step=gs,
                            error=repr(e), level="error")
 
+        finally:
+            self.log.record('review_time/evaluation_seconds',time.perf_counter()-start)
+
     def _safe_ckpt(self, gs: int, it: int) -> None:
         if gs in self._ckpt_saved:            # never write the same step twice
             return
+        start=time.perf_counter()
         try:
             # model pool: one file per checkpoint, named by global_step (never
             # overwritten) -- resume picks the newest, earlier steps stay for
@@ -158,3 +176,6 @@ class Monitor:
         except Exception as e:  # noqa: BLE001 -- losing a ckpt beats losing the run
             self.log.event("checkpoint_failed", iteration=it, global_step=gs,
                            error=repr(e), level="error")
+
+        finally:
+            self.log.record('review_time/checkpoint_seconds',time.perf_counter()-start)

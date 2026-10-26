@@ -7,6 +7,8 @@
 |---|---|---|
 | ppo | clipped policy objective + GAE | Discrete / 扁平连续 Box；分类或高斯头 |
 | ga2e | 用训练/验证梯度对齐选择 GAE lambda，支持 EMA | 同 PPO；可能显著增加梯度计算 |
+| aae | 熵、回归准确度及解析 KL 决定 actor/critic 两个 lambda | Discrete / 扁平连续 Box；四种组合 |
+| pae | 完整窗口估计 GAE，前缀更新，保留未消费尾部 | Discrete / 扁平连续 Box |
 | spo | 用软二次惩罚替换 PPO hard clipping | 同 PPO |
 | rvl | 成对相对价值学习与 R-GAE；不训练绝对价值头 | 同 PPO；需至少两个有效 transition |
 | dae | 轨迹回归学习 advantage，再执行策略改进 | 仅离散动作 |
@@ -57,6 +59,8 @@ algorithms:
 已对照原仓库 commit `17ff77b73de240974d42a1e3c3046da16e708c8c` 的实际执行行为修正，
 包括 epoch 0 再次选 lambda、两种 minibatch 顺序及未缩放的 value MSE。
 原源码数值对照、参数映射和验证边界见 [GA2E 一致性审计](ga2e_parity.md)。这不等同于论文性能复现。
+
+AAE、PAE 的参数、公式、论文歧义处理和断点恢复边界见 [优势估计器](advantage_estimators.md)。
 
 ## SPO / RVL / DAE
 

@@ -53,6 +53,8 @@ def save_checkpoint(path: str | Path, policy, *, global_step: int,
     payload: dict[str, Any] = {
         "policy": policy.state_dict(),
         "env_state": env_state,
+        "algorithm_state": (policy.algorithm_state_dict()
+                            if callable(getattr(policy, "algorithm_state_dict", None)) else None),
         "optimizer": opt.state_dict() if opt is not None else None,
         "python_rng": random.getstate(),
         "numpy_rng": np.random.get_state(),
@@ -92,7 +94,8 @@ def load_checkpoint(path: str | Path, policy, *,
         th.set_rng_state(rng.to("cpu", th.uint8))
     return {"global_step": int(ckpt.get("global_step", 0)),
             "iteration": int(ckpt.get("iteration", 0)),
-            "meta": ckpt.get("meta", {}), "env_state": ckpt.get("env_state")}
+            "meta": ckpt.get("meta", {}), "env_state": ckpt.get("env_state"),
+            "algorithm_state": ckpt.get("algorithm_state")}
 
 
 def peek_checkpoint(path: str | Path,

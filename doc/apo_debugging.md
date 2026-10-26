@@ -1,6 +1,8 @@
 # APO 调试与接口修复
 
-APO 使用连续 Box 动作。VS Code 选择 `APO: Debug (CPU / InvertedPendulum)` 后按 F5。
+APO 支持连续 Box 和离散 Discrete 动作；离散时要求 `1 <= ua_nums <= |A|-1`。
+连续调试：VS Code 选择 `APO: Debug (CPU / InvertedPendulum)` 后按 F5。
+新增指标和离散采样语义见 [审稿补充实现](review_extensions.md)。
 断点可放在 `APO._sample_policy`、`APO._make_batch_` 和 `APOPolicyLoss.__call__`。
 需要在框架捕获异常前暂停时，勾选 Raised Exceptions。
 
@@ -28,11 +30,22 @@ algorithms:
   apo:
     train:
       ua_nums: 3
+      uarr_coef: -1.0
 ```
 
 或在 launch.json 的 args 中加入 `"--set", "algorithms.apo.train.ua_nums=3"`。
 K 个未执行动作和 1 个执行动作都由 rollout 时的策略采样；仅执行动作进入环境。
 修复保留现有 APO 正则项公式，不代表完成论文/官方实现的一致性核验。
+
+`uarr_coef` 控制正则项的权重，默认 `-1.0`：
+
+- `uarr_coef >= 0`：固定权重，`uarr_loss = mean(0.5 * uarr_coef * (ratio - 1)^2)`；设为 0 关闭该正则项。
+- `uarr_coef < 0`：动态权重，`uarr_loss = mean(0.5 * old_prob * (ratio - 1)^2)`。
+  负数仅用于选择模式，其绝对值不参与计算；`old_prob = exp(old_log_prob)`，对每个状态的每个未执行动作分别计算。
+
+其中 `ratio = exp(new_log_prob - old_log_prob)`。连续动作下 old_prob 是联合概率密度。
+launch.json 可加入 `"--set", "algorithms.apo.train.uarr_coef=0.1"` 使用固定系数。
+日志 `apo/uarr_coef` 记录实际权重的均值，`apo/uarr_loss` 记录加权后的正则损失。
 
 针对性测试位于 `tests/test_apo.py`：覆盖 K=1/3、多维动作、旧概率与新概率一致性、
 截断与终止 bootstrap、两个连续 rollout 的参数更新，以及配置校验。

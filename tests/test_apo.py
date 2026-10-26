@@ -43,7 +43,7 @@ def test_rollout_samples_probabilities_bootstrap_and_update(k):
     torch.testing.assert_close(batch.uact_logprobs,batch.uact_old_logprobs)
     for i in range(k):
         torch.testing.assert_close(batch.uact_logprobs[:,i],p.evaluate(sample.observations,sample.uact[:,i])[0])
-    _,stats=algo.policy_loss(batch);assert stats['train/uarr_loss']==0
+    _,stats=algo.policy_loss(batch);assert stats['apo/uarr_loss']==0
     assert stats['train/clip_range']==pytest.approx(.08)
     before=[x.detach().clone() for x in p.parameters()]
     stats=algo._update_()
@@ -56,5 +56,36 @@ def test_config_and_unsupported_actions():
     assert asdict(APOConfig(ua_nums=4))['ua_nums']==4
     for value in [0,-1,True,1.5]:
         with pytest.raises(ValueError):APOConfig(ua_nums=value)
-    with pytest.raises(ValueError,match='continuous Box'):
+    with pytest.raises(ValueError,match='ua_nums'):
         build_policy(Env.obs_space,spaces.Discrete(2),PolicyConfig(),APOConfig())
+    with pytest.raises(ValueError,match='flat Box or Discrete'):
+        build_policy(Env.obs_space,spaces.MultiDiscrete([2,3]),PolicyConfig(),APOConfig())
+
+
+@pytest.mark.parametrize('coef',[-1.,-2.,0.,0.3,2.])
+def test_uarr_fixed_and_dynamic_coefficients(coef):
+    from types import SimpleNamespace
+    from onpolicy.apo import APOPolicyLoss
+    old_prob=torch.tensor([[.2,.5],[.8,.4]])
+    ratio=torch.tensor([[1.2,.7],[.9,1.4]])
+    logp=(old_prob*ratio).log().requires_grad_()
+    batch=SimpleNamespace(progress=0.,logp=torch.zeros(2),old_log_prob=torch.zeros(2),
+                          advantages=torch.zeros(2),uact_logprobs=logp,
+                          uact_old_logprobs=old_prob.log())
+    loss,stats=APOPolicyLoss(uarr_coef=coef)(batch)
+    weight=old_prob if coef<0 else torch.full_like(old_prob,coef)
+    expected=(.5*weight*(ratio-1).square()).mean()
+    torch.testing.assert_close(loss,expected)
+    loss.backward()
+    torch.testing.assert_close(logp.grad,weight*(ratio-1)*ratio/ratio.numel())
+    assert stats['apo/uarr_coef']==pytest.approx(float(weight.mean()))
+    assert stats['apo/uarr_loss']==pytest.approx(float(expected),abs=1e-7)
+
+
+def test_uarr_config_reaches_loss():
+    cfg=APOConfig(uarr_coef=.7,num_envs=2,rollout_len=4)
+    env=Env();p=build_policy(env.obs_space,env.action_space,PolicyConfig(net_arch=(8,)),cfg)
+    algo=APO(env,p,make_apo_buffer(cfg,env),cfg)
+    assert asdict(cfg)['uarr_coef']==.7
+    assert algo.policy_loss.uarr_coef==.7
+    assert APOConfig().uarr_coef<0

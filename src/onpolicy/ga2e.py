@@ -4,6 +4,9 @@ No SB3 runtime dependency. Explicitly preserves the source's extra epoch-zero
 selection, NumPy search reductions, two different minibatch layouts, and losses.
 """
 from dataclasses import dataclass
+import time
+from onpolicy._review_metrics import ReviewConfig, ReviewMixin
+from onpolicy._ga2e_review import search_review, split_review, ema_review
 import numpy as np
 import torch as th
 from torch.nn import functional as F
@@ -12,7 +15,8 @@ from onpolicy._runtime import NativeLoop, run_algorithm
 
 
 @dataclass
-class GA2EConfig(PPOConfig):
+class GA2EConfig(ReviewConfig, PPOConfig):
+    update_data: str = 'all'  # actor: all | candidate; critic ALWAYS uses all
     lambda_min: float = .1
     lambda_val: float = .97
     level2_points: int = 10
@@ -31,6 +35,7 @@ class GA2EConfig(PPOConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.update_data not in ("all","candidate"):raise ValueError("update_data must be all or candidate")
         if not (0<=self.lambda_min<=1 and 0<=self.lambda_val<=1 and 0<=self.ema_beta<1):
             raise ValueError('Invalid GA2E lambda/EMA range')
         if self.val_every<2 or self.level2_points<1:raise ValueError('Invalid GA2E search parameters')
@@ -41,7 +46,7 @@ class GA2EConfig(PPOConfig):
         if self.parity_version != 'posterior-17ff77b-v1':raise ValueError('Unsupported GA2E parity version')
 
 
-class GA2E(NativeLoop):
+class _GA2ECore(NativeLoop):
     def _deltas_cont(self):
         """SB3-equivalent timeout reward correction; SameStep has all valid rows.
 
@@ -83,10 +88,12 @@ class GA2E(NativeLoop):
             (val if i%self.config.val_every==0 else tr)[s:e,n]=True
         # Search uses C-order (time-major), NOT concatenated environment segments.
         train,validation=np.flatnonzero(tr.reshape(-1)),np.flatnonzero(val.reshape(-1))
+        self._candidate_indices=train.copy();self._reference_indices=validation.copy()
         self._n_segments=len(segments);self._val_frac=len(validation)/(b.T*b.N)
         self._split_degenerate=min(len(train),len(validation))<8
         if self._split_degenerate:
             train=validation=np.flatnonzero(b['valid'][:b.T].cpu().numpy().reshape(-1));self._val_frac=1.
+        if self.config.review_metrics:split_review(self,segments,train,validation)
         return train,validation
 
     def _policy_grads_batch(self,advantages,idx,normalize=False,clip_range=None):
@@ -138,25 +145,32 @@ class GA2E(NativeLoop):
         return result
 
     def _select_lambda(self,clip_range=None):
+        search_start=time.perf_counter()
         c=self.config;delta,cont=self._deltas_cont();tr,val=self.split()
         ref=self.gradient(self._gae(delta,cont,c.lambda_val),val,clip_range=clip_range)
+        ref_raw=ref.detach().clone();diagnostic_grads={};gradient_evals=1
         ref=ref/(ref.norm()+1e-8);cache={};parts={};grad_cache={}
         def evaluate(grid):
+            nonlocal gradient_evals
             if c.var_penalty_beta<=0:
                 todo=[lam for lam in grid if round(float(lam),3) not in grad_cache]
                 if todo:
+                    gradient_evals+=len(todo)
                     gradients=self._policy_grads_batch([self._gae(delta,cont,l) for l in todo],tr,True,clip_range)
                     for lam,g in zip(todo,gradients):grad_cache[round(float(lam),3)]=g.clone()
                 for lam in grid:
                     key=round(float(lam),3);g=grad_cache[key]
                     bias=float(ref@g/(g.norm()+1e-8));cache[key]=bias;parts[key]=(bias,0.)
+                    diagnostic_grads[key]=g
             else:
                 for lam in grid:
                     key=round(float(lam),3)
                     if key in cache:continue
                     adv=self._gae(delta,cont,key)
                     gs=[self.gradient(adv,f,True,clip_range) for f in np.array_split(tr,max(2,c.n_var_folds)) if f.size>=4]
+                    gradient_evals+=len(gs)
                     G=th.stack(gs);mean=G.mean(0)
+                    diagnostic_grads[key]=mean
                     bias=float(ref@mean/(mean.norm()+1e-8))
                     var=float(((G-mean)**2).sum(1).mean())/(float((mean**2).sum())+1e-12)
                     cache[key]=bias-c.var_penalty_beta*var;parts[key]=(bias,var)
@@ -167,6 +181,11 @@ class GA2E(NativeLoop):
             grid=[round(lo+(hi-lo)*j/c.level2_points,3) for j in range(c.level2_points+1)]
             evaluate(grid);best=max(grid,key=lambda l:cache[round(float(l),3)])
         self._score_bias,self._score_var=parts[round(best,3)]
+        self.log.record('review_time/search_seconds',time.perf_counter()-search_start)
+        self.log.record('review_search/gradient_evaluations',gradient_evals)
+        self.log.record('review_search/search_calls',1)
+        if c.review_metrics:
+            search_review(self,best,cache,parts,diagnostic_grads,ref_raw,delta,cont,tr,val,clip_range)
         return best,cache
 
     def _ema_update(self,star):
@@ -174,7 +193,9 @@ class GA2E(NativeLoop):
         previous=float(p.lambda_ema)
         raw=c.ema_beta*previous+(1-c.ema_beta)*star if bool(p.lambda_initialized) else star
         p.lambda_ema.fill_(raw);p.lambda_initialized.fill_(True)
-        return float(np.clip(raw,c.lambda_min,1.))
+        used=float(np.clip(raw,c.lambda_min,1.))
+        if c.review_metrics:ema_review(self,star,previous,raw,used)
+        return used
 
     def _record_lambda(self,star,used,curve,n_evals=None):
         values={'lambda_star':star,'lambda_used':used,'val_frac':self._val_frac,
@@ -208,8 +229,20 @@ class GA2E(NativeLoop):
         order=np.arange(N).reshape(b.T,b.N).T.reshape(-1) if not epoch_mode else np.arange(N)
         order=order[np.isin(order,valid)]
         bs=c.batch_size or max(1,len(order)//c.num_mini_batch)
+        # Keep all minibatches for the critic; mask only the actor objective.
+        if c.update_data == 'candidate':
+            if not len(self._candidate_indices):raise ValueError('candidate-only actor has no candidate samples; collect more trajectory segments')
+        self._critic_update_indices=order.copy()
+        self._update_indices=order[np.isin(order,self._candidate_indices)] if c.update_data=='candidate' else order.copy()
+        self.log.record('review/actor_update_samples',len(self._update_indices))
+        self.log.record('review/critic_update_samples',len(order))
+        self.log.record('review/update_candidate_only',float(c.update_data=='candidate'))
+        self.log.record('review/update_reference_overlap',len(np.intersect1d(self._update_indices,self._reference_indices)))
+        self.log.record('review/critic_target_lambda',c.value_ref_lambda if c.value_ref_lambda is not None else used0)
         progress=min(1.,self.global_step/c.total_steps);eps=self.policy_loss._current_eps(progress)
-        records=[];stop=False
+        records=[];stop=False;actor_stopped=False
+        candidate_mask=th.zeros(N,dtype=th.bool,device=b.device)
+        candidate_mask[th.as_tensor(self._candidate_indices,device=b.device)]=True
         for epoch in range(c.ppo_epoch):
             if epoch_mode:
                 # Intentionally repeat selection even for epoch 0 (reference's executed code).
@@ -223,33 +256,51 @@ class GA2E(NativeLoop):
                 with self.timer('bwd'):
                     logp,entropy,value=self.policy.evaluate(self.flat('obs')[ids],self.flat('action')[ids])
                     adv=self.flat('advantages')[ids]
+                    old=self.flat('logprob')[ids]
+                    if c.update_data=='candidate':
+                        mask=candidate_mask[ids] if not actor_stopped else th.zeros_like(ids,dtype=th.bool)
+                        logp=logp[mask];adv=adv[mask];old=old[mask]
+                        if entropy is not None:entropy=entropy[mask]
                     if c.normalize_advantage and len(adv)>1:adv=(adv-adv.mean())/(adv.std()+1e-8)
-                    old=self.flat('logprob')[ids];ratio=(logp-old).exp()
+                    ratio=(logp-old).exp()
                     spo=c.use_spo and not epoch_mode
-                    if spo:pg=-(adv*ratio-adv.abs()*(ratio-1).square()/(2*max(1e-3,eps))).mean()
+                    if not len(adv):pg=value.new_zeros(())
+                    elif spo:pg=-(adv*ratio-adv.abs()*(ratio-1).square()/(2*max(1e-3,eps))).mean()
                     else:pg=-th.min(adv*ratio,adv*ratio.clamp(1-eps,1+eps)).mean()
                     pred=value if not c.use_value_clipped else self.flat('value')[ids]+(value-self.flat('value')[ids]).clamp(-c.vf_epsilon,c.vf_epsilon)
                     vl=F.mse_loss(self.flat('returns')[ids],pred)
-                    ent_loss=-entropy.mean() if entropy is not None else logp.mean()
+                    ent_loss=(-entropy.mean() if entropy is not None else logp.mean()) if len(adv) else value.new_zeros(())
                     entropy_coef=max(.01,c.ent_coef*(1-progress)) if spo else c.ent_coef
-                    logratio=logp-old;kl=(logratio.exp()-1-logratio).mean()
+                    logratio=logp-old;kl=(logratio.exp()-1-logratio).mean() if len(adv) else value.new_zeros(())
                     loss=pg+entropy_coef*ent_loss+c.vf_coef*vl
                     if not epoch_mode and not spo and c.kl_coef>0:loss=loss+c.kl_coef*kl
                     stat={'loss/policy':float(pg.detach()),'loss/value':float(vl.detach()),'loss/entropy':float(ent_loss.detach()),
                         'loss/total':float(loss.detach()),'train/kl':float(kl.detach()),'train/clip_range':eps,
-                        'train/clipfrac':float(((ratio-1).abs()>eps).float().mean().detach())}
+                        'train/clipfrac':float(((ratio-1).abs()>eps).float().mean().detach()) if len(adv) else 0.,
+                        'review/actor_minibatch_samples':len(adv),'review/critic_minibatch_samples':len(ids)}
                     records.append(stat)
                     # Reference stops before the offending optimizer step, at 1.5*threshold.
-                    if c.target_kl is not None and stat['train/kl']>1.5*c.target_kl:stop=True;break
+                    if c.target_kl is not None and stat['train/kl']>1.5*c.target_kl:
+                        if c.update_data=='all':stop=True;break
+                        # Candidate mode still trains value on every valid row.
+                        actor_stopped=True;loss=c.vf_coef*vl
+                        stat.update({'loss/total':float(loss.detach()),'loss/policy':0.,'loss/entropy':0.,'review/actor_minibatch_samples':0})
                     self.policy.optimizer.zero_grad();loss.backward()
                     norm=th.nn.utils.clip_grad_norm_(self.policy.parameters(),c.max_grad_norm)
                     self.policy.optimizer.step();stat['train/grad_norm']=float(norm)
                 self.log.add(**stat)
             if stop:break
+        self.log.record('review/epochs_entered',epoch+1)
+        self.log.record('review/early_stop',float(stop))
+        self.log.record('review/actor_early_stop',float(actor_stopped))
         if epoch_mode:
             self._record_lambda(star0,float(np.mean(history)),curve0,evaluations)
             self.log.record('ga2e/lambda_epoch_std',float(np.std(history)))
         return records[-1] if records else {}
+
+
+class GA2E(ReviewMixin, _GA2ECore):
+    """Wrap original estimation/update entrypoints with read-only diagnostics."""
 
 
 def train(cfg,env,policy,log=None,monitor=None,resume=None):

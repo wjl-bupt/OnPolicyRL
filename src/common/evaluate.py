@@ -39,7 +39,7 @@ def _greedy_action(policy, obs) -> th.Tensor:
 
 @th.no_grad()
 def evaluate(policy, env_factory: Callable[[], object], *, episodes: int = 10,
-             seed: int = 0, deterministic: bool = True) -> dict[str, float]:
+             seed: int = 0, deterministic: bool = True, return_details: bool = False) -> dict:
     """Run ``policy`` for ``episodes`` complete episodes on a fresh env.
 
     ``env_factory()`` must return a GymVectorAdapter-like object (``reset(seed)``,
@@ -53,6 +53,7 @@ def evaluate(policy, env_factory: Callable[[], object], *, episodes: int = 10,
     returns: list[float] = []
     lengths: list[float] = []
     achievements = []
+    termination_flags=[];truncation_flags=[]
     # Fixed quotas avoid favoring short episodes in vectorized evaluation.
     n_envs = int(getattr(env, 'num_envs', 1))
     targets = [(episodes + i) // n_envs for i in range(n_envs)]
@@ -75,6 +76,8 @@ def evaluate(policy, env_factory: Callable[[], object], *, episodes: int = 10,
                 counts[index] += 1
                 returns.append(float(ep_ret))
                 lengths.append(float(ep_len))
+                termination_flags.append(bool(_masks.terminated[index]) if _masks is not None else None)
+                truncation_flags.append(bool(_masks.truncated[index]) if _masks is not None else None)
                 if position < len(completed_achievements):
                     achievements.append(completed_achievements[position])
             if len(returns) >= episodes:
@@ -89,7 +92,7 @@ def evaluate(policy, env_factory: Callable[[], object], *, episodes: int = 10,
     n = len(returns)
     if n == 0:                                     # no episode finished in the cap
         return {"eval/ep_rew_mean": float("nan"), "eval/ep_rew_std": float("nan"),
-                "eval/ep_len_mean": float("nan"), "eval/n_episodes": 0.0}
+                "eval/ep_len_mean": float("nan"), "eval/n_episodes": 0.0, "eval/requested_episodes": float(episodes), "eval/complete": 0.0}
     rew = th.tensor(returns)
     length = th.tensor(lengths)
     result = {
@@ -97,10 +100,24 @@ def evaluate(policy, env_factory: Callable[[], object], *, episodes: int = 10,
         "eval/ep_rew_std": float(rew.std(unbiased=False)),   # 1-episode std = 0, not NaN
         "eval/ep_len_mean": float(length.mean()),
         "eval/n_episodes": float(n),
+        "eval/requested_episodes":float(episodes),
+        "eval/complete":float(n==episodes),
+        "eval/seed":float(seed),
+        "eval/deterministic":float(deterministic),
+        "eval/raw_reward":1.,
+        "eval/ep_rew_median":float(rew.quantile(.5)),
+        "eval/ep_rew_p05":float(rew.quantile(.05)),
+        "eval/ep_rew_p95":float(rew.quantile(.95)),
+        "eval/ep_len_std":float(length.std(unbiased=False)),
+        "eval/termination_flags_known":float(sum(v is not None for v in termination_flags[:n])),
     }
 
+    if all(v is not None for v in termination_flags[:n]):
+        result['eval/terminated_fraction']=sum(termination_flags[:n])/n
+        result['eval/truncated_fraction']=sum(truncation_flags[:n])/n
     if achievements:
         rates = th.tensor(achievements, dtype=th.float32).gt(0).float().mean(0)
         result.update({f'eval/achievement_{i}': float(r) for i, r in enumerate(rates)})
         result['eval/achievements_mean'] = float(rates.sum())
+    if return_details:result['_episode_details']=dict(returns=returns,lengths=lengths,terminated=termination_flags[:n],truncated=truncation_flags[:n])
     return result
